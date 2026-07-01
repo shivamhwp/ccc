@@ -125,10 +125,7 @@ async fn proxy_inner(
     let token = ensure_fresh_token(&state, &profile_name).await?;
 
     // 4: build upstream request.
-    let path_and_query = uri
-        .path_and_query()
-        .map(|pq| pq.as_str())
-        .unwrap_or("/");
+    let path_and_query = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
     let url = format!("{}{}", oauthcfg::upstream_base(), path_and_query);
 
     let mut fwd = HeaderMap::new();

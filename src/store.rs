@@ -140,7 +140,12 @@ pub fn now_ms() -> i64 {
 #[cfg(target_os = "macos")]
 pub fn read_keychain_login() -> Result<serde_json::Value> {
     let out = std::process::Command::new("security")
-        .args(["find-generic-password", "-s", "Claude Code-credentials", "-w"])
+        .args([
+            "find-generic-password",
+            "-s",
+            "Claude Code-credentials",
+            "-w",
+        ])
         .output()
         .context("running `security` to read Keychain")?;
     if !out.status.success() {
@@ -159,8 +164,7 @@ pub fn read_keychain_login() -> Result<serde_json::Value> {
 pub fn read_keychain_login() -> Result<serde_json::Value> {
     // Linux/Windows: Claude Code stores a plaintext credentials file.
     let path = paths::claude_dir()?.join(".credentials.json");
-    let bytes = std::fs::read(&path)
-        .with_context(|| format!("reading {}", path.display()))?;
+    let bytes = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
     let v: serde_json::Value = serde_json::from_slice(&bytes)?;
     v.get("claudeAiOauth")
         .cloned()
@@ -214,4 +218,64 @@ pub fn read_claude_identity() -> Option<serde_json::Value> {
     f.read_to_string(&mut s).ok()?;
     let v: serde_json::Value = serde_json::from_str(&s).ok()?;
     v.get("oauthAccount").cloned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_oauth_blob() {
+        let v = serde_json::json!({
+            "accessToken": "sk-ant-oat01-abc",
+            "refreshToken": "sk-ant-ort01-def",
+            "expiresAt": 1782967530954i64,
+            "scopes": ["user:inference", "user:profile"],
+            "subscriptionType": "max"
+        });
+        let p = profile_from_oauth(&v).unwrap();
+        assert_eq!(p.access_token, "sk-ant-oat01-abc");
+        assert_eq!(p.refresh_token, "sk-ant-ort01-def");
+        assert_eq!(p.expires_at, 1782967530954);
+        assert_eq!(p.subscription_type.as_deref(), Some("max"));
+        assert_eq!(p.scopes.len(), 2);
+    }
+
+    #[test]
+    fn needs_refresh_respects_skew() {
+        let mut p = profile_from_oauth(&serde_json::json!({
+            "accessToken": "t", "refreshToken": "r", "expiresAt": 0
+        }))
+        .unwrap();
+        // Already expired.
+        assert!(p.needs_refresh(0));
+        // Far future, no skew -> fresh.
+        p.expires_at = now_ms() + 10 * 60 * 1000;
+        assert!(!p.needs_refresh(0));
+        // Within skew window -> needs refresh.
+        assert!(p.needs_refresh(11 * 60 * 1000));
+    }
+
+    #[test]
+    fn resolve_default_prefers_explicit_then_solo() {
+        let mut s = Store {
+            version: 1,
+            default_profile: None,
+            profiles: Default::default(),
+        };
+        let mk = || {
+            profile_from_oauth(&serde_json::json!({
+                "accessToken":"t","refreshToken":"r","expiresAt":0
+            }))
+            .unwrap()
+        };
+        s.profiles.insert("only".into(), mk());
+        // Single profile resolves even without an explicit default.
+        assert_eq!(s.resolve_default(), Some("only"));
+        s.profiles.insert("second".into(), mk());
+        // Ambiguous without explicit default.
+        assert_eq!(s.resolve_default(), None);
+        s.default_profile = Some("second".into());
+        assert_eq!(s.resolve_default(), Some("second"));
+    }
 }

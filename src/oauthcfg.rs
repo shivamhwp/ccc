@@ -5,17 +5,26 @@
 //! be worked around without recompiling.
 
 pub fn client_id() -> String {
-    env_or("CCC_OAUTH_CLIENT_ID", "9d1c250a-e61b-44d9-88ed-5944d1962f5e")
+    env_or(
+        "CCC_OAUTH_CLIENT_ID",
+        "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
+    )
 }
 
 /// claude.ai subscription authorize endpoint.
 pub fn authorize_url() -> String {
-    env_or("CCC_OAUTH_AUTHORIZE_URL", "https://claude.ai/oauth/authorize")
+    env_or(
+        "CCC_OAUTH_AUTHORIZE_URL",
+        "https://claude.ai/oauth/authorize",
+    )
 }
 
 /// Token grant endpoint (authorization_code + refresh_token).
 pub fn token_url() -> String {
-    env_or("CCC_OAUTH_TOKEN_URL", "https://platform.claude.com/v1/oauth/token")
+    env_or(
+        "CCC_OAUTH_TOKEN_URL",
+        "https://platform.claude.com/v1/oauth/token",
+    )
 }
 
 /// Redirect used by the manual copy/paste flow.

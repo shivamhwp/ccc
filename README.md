@@ -40,10 +40,55 @@ identically, and t3code's spawned `claude` processes route the same way.
 
 ## Install
 
+Prebuilt binaries are published on every tagged release (see below).
+
 ```sh
-cargo build --release
-# put target/release/ccc on your PATH
+# macOS / Linux one-liner (downloads the right binary from the latest release)
+curl -fsSL https://raw.githubusercontent.com/shivamhwp/ccc/main/scripts/install.sh | bash
+
+# or build from source
+cargo build --release   # binary at target/release/ccc
 ```
+
+On Windows, download the `.zip` from the Releases page and put `ccc.exe` on your PATH.
+
+## Platform support
+
+| Platform | Binary | Per-thread routing | Daemon autostart |
+|----------|:------:|:------------------:|:----------------:|
+| macOS (arm64/x64) | ✅ | ✅ | ✅ launchd |
+| Linux (x64)       | ✅ | ✅ (`lsof`/`ps`)   | ⏳ systemd unit (planned) |
+| Windows (x64)     | ✅ builds | ⏳ needs native port | ⏳ planned |
+
+macOS is the fully-supported target today. Linux routing works where `lsof`
+and `ps` are present; autostart is manual (`ccc daemon run`) until a systemd
+unit lands. Windows binaries build and the CLI/proxy run, but per-thread routing
+and autostart need a native (iphlpapi/toolhelp) backend — treat Windows as
+experimental.
+
+## Testing
+
+```sh
+cargo test            # unit tests (parsing, PKCE, store, routing resolution)
+./scripts/smoke.sh    # end-to-end: proves auth + per-thread routing live
+```
+
+`smoke.sh` starts the daemon on a scratch port, creates a throwaway account with
+a broken token, routes a shell to it (expects failure), reverts to the default
+account (expects success), and cleans up. It uses your real saved account for
+the success path but never touches `~/.claude`.
+
+## Releases
+
+Push a tag and GitHub Actions builds and publishes binaries for all targets:
+
+```sh
+git tag v0.1.0 && git push origin v0.1.0
+```
+
+The `release` workflow cross-builds macOS (arm64 + x64), Linux (x64 gnu + musl),
+and Windows (x64), packages tarballs/zips with SHA-256 checksums, and creates
+the GitHub Release. `ci` runs fmt + clippy + tests on every push/PR.
 
 ## Usage
 

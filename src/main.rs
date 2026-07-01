@@ -20,7 +20,11 @@ use clap::{Parser, Subcommand};
 use store::{now_ms, Store};
 
 #[derive(Parser)]
-#[command(name = "ccc", version, about = "Multi-account switching for Claude Code (subscription auth)")]
+#[command(
+    name = "ccc",
+    version,
+    about = "Multi-account switching for Claude Code (subscription auth)"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -57,13 +61,9 @@ enum Command {
         pid: Option<u32>,
     },
     /// Set the default account (used by threads with no explicit route).
-    Default {
-        name: String,
-    },
+    Default { name: String },
     /// Remove a saved account.
-    Remove {
-        name: String,
-    },
+    Remove { name: String },
     /// Diagnostics: verify the daemon, settings, and auth path.
     Doctor,
     /// Daemon control.
@@ -200,7 +200,10 @@ async fn cmd_login(name: &str) -> Result<()> {
         Ok(first)
     })?;
 
-    println!("✓ saved account `{name}`{}", if is_first { " (set as default)" } else { "" });
+    println!(
+        "✓ saved account `{name}`{}",
+        if is_first { " (set as default)" } else { "" }
+    );
     Ok(())
 }
 
@@ -246,7 +249,7 @@ fn cmd_list() -> Result<()> {
         return Ok(());
     }
     let default = store.resolve_default().map(str::to_string);
-    println!("{:<16} {:<28} {:<10} {}", "PROFILE", "EMAIL", "PLAN", "");
+    println!("{:<16} {:<28} {:<10}", "PROFILE", "EMAIL", "PLAN");
     for (name, p) in &store.profiles {
         let marker = if default.as_deref() == Some(name.as_str()) {
             "* (default)"
@@ -433,7 +436,14 @@ async fn cmd_doctor() -> Result<()> {
         println!("• agent skill not installed (run `ccc setup`)");
     }
 
-    println!("\n{}", if ok { "All core checks passed." } else { "Some checks failed — see above." });
+    println!(
+        "\n{}",
+        if ok {
+            "All core checks passed."
+        } else {
+            "Some checks failed — see above."
+        }
+    );
     Ok(())
 }
 

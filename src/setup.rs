@@ -30,14 +30,15 @@ pub fn patch_settings(base_url: &str) -> Result<String> {
         anyhow::bail!("settings.json is not a JSON object");
     }
     let obj = root.as_object_mut().unwrap();
-    let env = obj
-        .entry("env")
-        .or_insert_with(|| serde_json::json!({}));
+    let env = obj.entry("env").or_insert_with(|| serde_json::json!({}));
     if !env.is_object() {
         *env = serde_json::json!({});
     }
     let env_obj = env.as_object_mut().unwrap();
-    env_obj.insert("ANTHROPIC_BASE_URL".to_string(), serde_json::json!(base_url));
+    env_obj.insert(
+        "ANTHROPIC_BASE_URL".to_string(),
+        serde_json::json!(base_url),
+    );
     // Claude Code has a local auth gate: it will not send any request unless it
     // believes it is authenticated. A placeholder auth token satisfies that gate
     // so every thread reaches the proxy; the proxy always overwrites the

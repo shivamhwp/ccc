@@ -27,8 +27,18 @@ pub fn pid_owning_local_port(port: u16, exclude: u32) -> Option<u32> {
         return None;
     }
     let text = String::from_utf8_lossy(&out.stdout);
+    parse_owner_from_lsof(&text, port, exclude)
+}
+
+/// Pure parser for `lsof -Fpn` output: find the pid (≠ `exclude`) with a socket
+/// whose *local* port equals `port`. Separated out so it can be unit-tested
+/// without spawning lsof.
+fn parse_owner_from_lsof(output: &str, port: u16, exclude: u32) -> Option<u32> {
     let mut cur_pid: Option<u32> = None;
-    for line in text.lines() {
+    for line in output.lines() {
+        if line.is_empty() {
+            continue;
+        }
         let (tag, rest) = line.split_at(1);
         match tag {
             "p" => cur_pid = rest.parse::<u32>().ok(),
@@ -40,12 +50,7 @@ pub fn pid_owning_local_port(port: u16, exclude: u32) -> Option<u32> {
                 // NAME is `127.0.0.1:LOCAL->127.0.0.1:REMOTE`. The client's
                 // local port (left of `->`) equals the ephemeral `port`.
                 if let Some((local, _remote)) = rest.split_once("->") {
-                    if local
-                        .rsplit(':')
-                        .next()
-                        .and_then(|p| p.parse::<u16>().ok())
-                        == Some(port)
-                    {
+                    if local.rsplit(':').next().and_then(|p| p.parse::<u16>().ok()) == Some(port) {
                         return Some(pid);
                     }
                 }
@@ -141,4 +146,31 @@ pub fn pid_alive(pid: u32) -> bool {
 /// Our own pid.
 pub fn self_pid() -> u32 {
     std::process::id()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn picks_client_pid_by_local_port() {
+        // curl (pid 111) local port 50123 -> daemon 8791; daemon (pid 222) is
+        // the reverse. We want 111 when looking up local port 50123.
+        let out =
+            "p111\nn127.0.0.1:50123->127.0.0.1:8791\np222\nn127.0.0.1:8791->127.0.0.1:50123\n";
+        assert_eq!(parse_owner_from_lsof(out, 50123, 222), Some(111));
+    }
+
+    #[test]
+    fn excludes_daemon_pid() {
+        // Only the daemon side is present for this port; must not match it.
+        let out = "p222\nn127.0.0.1:8791->127.0.0.1:50123\n";
+        assert_eq!(parse_owner_from_lsof(out, 8791, 222), None);
+    }
+
+    #[test]
+    fn no_match_returns_none() {
+        let out = "p111\nn127.0.0.1:50123->127.0.0.1:8791\n";
+        assert_eq!(parse_owner_from_lsof(out, 40000, 999), None);
+    }
 }

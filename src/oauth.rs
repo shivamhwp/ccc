@@ -113,7 +113,9 @@ pub async fn exchange_code(pkce: &Pkce, pasted: &str) -> Result<Profile> {
 /// Refresh a profile's tokens in place. Returns the updated profile.
 pub async fn refresh(profile: &Profile) -> Result<Profile> {
     if profile.refresh_token.is_empty() {
-        return Err(anyhow!("profile has no refresh token; run `ccc login` again"));
+        return Err(anyhow!(
+            "profile has no refresh token; run `ccc login` again"
+        ));
     }
     let body = serde_json::json!({
         "grant_type": "refresh_token",
@@ -215,4 +217,39 @@ fn urlencode(s: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pkce_challenge_is_s256_of_verifier() {
+        let pkce = new_pkce();
+        let mut h = Sha256::new();
+        h.update(pkce.verifier.as_bytes());
+        let expected = b64url(&h.finalize());
+        assert_eq!(pkce.challenge, expected);
+        // base64url, no padding
+        assert!(!pkce.challenge.contains('='));
+        assert!(!pkce.challenge.contains('+'));
+        assert!(!pkce.challenge.contains('/'));
+    }
+
+    #[test]
+    fn authorize_url_carries_pkce_and_client() {
+        let pkce = new_pkce();
+        let url = authorize_url(&pkce);
+        assert!(url.contains("code_challenge_method=S256"));
+        assert!(url.contains(&format!("code_challenge={}", pkce.challenge)));
+        assert!(url.contains(&format!("state={}", pkce.state)));
+        assert!(url.contains("response_type=code"));
+        assert!(!url.ends_with('&'));
+    }
+
+    #[test]
+    fn urlencode_escapes_reserved() {
+        assert_eq!(urlencode("a b:c/d"), "a%20b%3Ac%2Fd");
+        assert_eq!(urlencode("safe-_.~"), "safe-_.~");
+    }
 }
