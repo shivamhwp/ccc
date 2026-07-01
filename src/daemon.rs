@@ -2,7 +2,9 @@
 
 #[cfg(not(target_os = "macos"))]
 use anyhow::anyhow;
-use anyhow::{Context, Result};
+#[cfg(target_os = "macos")]
+use anyhow::Context;
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::io::Write;
 
@@ -10,6 +12,7 @@ use crate::paths;
 use crate::procinfo;
 
 pub const DEFAULT_PORT: u16 = 8787;
+#[cfg(target_os = "macos")]
 const LAUNCHD_LABEL: &str = "ing.shivam.ccc";
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -51,6 +54,7 @@ pub fn base_url() -> String {
     format!("http://127.0.0.1:{port}")
 }
 
+#[cfg(target_os = "macos")]
 fn plist_path() -> Result<std::path::PathBuf> {
     Ok(paths::home()?
         .join("Library/LaunchAgents")
