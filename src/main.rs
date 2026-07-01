@@ -13,6 +13,7 @@ mod proxy;
 mod routes;
 mod setup;
 mod store;
+mod t3;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -71,6 +72,19 @@ enum Command {
         #[command(subcommand)]
         action: DaemonAction,
     },
+    /// t3code integration.
+    T3 {
+        #[command(subcommand)]
+        action: T3Action,
+    },
+}
+
+#[derive(Subcommand)]
+enum T3Action {
+    /// Add/update one t3code provider instance per ccc account.
+    Sync,
+    /// Remove all ccc-managed instances from t3code.
+    Unsync,
 }
 
 #[derive(Subcommand)]
@@ -117,7 +131,30 @@ async fn run() -> Result<()> {
             DaemonAction::Stop => cmd_daemon_stop(),
             DaemonAction::Status => cmd_daemon_status(),
         },
+        Command::T3 { action } => match action {
+            T3Action::Sync => cmd_t3_sync(),
+            T3Action::Unsync => cmd_t3_unsync(),
+        },
     }
+}
+
+fn cmd_t3_sync() -> Result<()> {
+    let ids = t3::sync()?;
+    println!("✓ synced {} account(s) into t3code:", ids.len());
+    for id in &ids {
+        println!("    {id}");
+    }
+    if !daemon::is_running() {
+        eprintln!("warning: the ccc daemon is not running — run `ccc daemon start`.");
+    }
+    println!("\nRestart t3code (or reload its settings) to see the new providers.");
+    Ok(())
+}
+
+fn cmd_t3_unsync() -> Result<()> {
+    let n = t3::unsync()?;
+    println!("✓ removed {n} ccc-managed instance(s) from t3code");
+    Ok(())
 }
 
 async fn cmd_setup() -> Result<()> {

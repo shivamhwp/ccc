@@ -107,25 +107,35 @@ async fn proxy_inner(
     let uri: Uri = parts.uri;
     let in_headers: HeaderMap = parts.headers;
 
-    // 1 + 2: attribute connection to a profile.
-    let (profile_name, matched_pid) = resolve_profile(peer.port(), state.self_pid)?;
+    // A `/a/<account>` path prefix pins the account explicitly (used by t3code,
+    // where each provider instance sets its own base URL). It takes precedence
+    // over PID-based routing. Otherwise fall back to PID → default.
+    let (pin, fwd_path) = extract_account_pin(uri.path());
+    let (profile_name, matched_pid) = match pin {
+        Some(ref name) if Store::load()?.profiles.contains_key(name) => (name.clone(), None),
+        _ => resolve_profile(peer.port(), state.self_pid)?,
+    };
     if state.log {
         eprintln!(
-            "[ccc] {} {} pid={} profile={}",
+            "[ccc] {} {} pid={} profile={}{}",
             method,
             uri.path(),
             matched_pid
                 .map(|p| p.to_string())
                 .unwrap_or_else(|| "?".into()),
-            profile_name
+            profile_name,
+            if pin.is_some() { " (pinned)" } else { "" },
         );
     }
 
     // 3: ensure a fresh token for that profile.
     let token = ensure_fresh_token(&state, &profile_name).await?;
 
-    // 4: build upstream request.
-    let path_and_query = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
+    // 4: build upstream request (with any `/a/<account>` prefix stripped).
+    let path_and_query = match uri.query() {
+        Some(q) => format!("{fwd_path}?{q}"),
+        None => fwd_path,
+    };
     let url = format!("{}{}", oauthcfg::upstream_base(), path_and_query);
 
     let mut fwd = HeaderMap::new();
@@ -171,6 +181,22 @@ async fn proxy_inner(
     *response.status_mut() = status;
     *response.headers_mut() = resp_headers;
     Ok(response)
+}
+
+/// Split off a leading `/a/<account>` prefix. Returns the pinned account name
+/// (if any) and the path to forward upstream. `/a/work/v1/messages` →
+/// `(Some("work"), "/v1/messages")`; `/v1/messages` → `(None, "/v1/messages")`.
+fn extract_account_pin(path: &str) -> (Option<String>, String) {
+    if let Some(rest) = path.strip_prefix("/a/") {
+        let (name, tail) = match rest.split_once('/') {
+            Some((n, t)) => (n, format!("/{t}")),
+            None => (rest, "/".to_string()),
+        };
+        if !name.is_empty() {
+            return (Some(name.to_string()), tail);
+        }
+    }
+    (None, path.to_string())
 }
 
 /// Resolve the profile for an inbound connection from `peer_port`. Returns the
@@ -267,4 +293,33 @@ fn is_hop_by_hop(name: &HeaderName) -> bool {
             | "upgrade"
             | "content-length"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::extract_account_pin;
+
+    #[test]
+    fn pins_account_from_path_prefix() {
+        assert_eq!(
+            extract_account_pin("/a/work/v1/messages"),
+            (Some("work".into()), "/v1/messages".into())
+        );
+    }
+
+    #[test]
+    fn no_prefix_passes_through() {
+        assert_eq!(
+            extract_account_pin("/v1/messages"),
+            (None, "/v1/messages".into())
+        );
+    }
+
+    #[test]
+    fn bare_account_prefix_forwards_root() {
+        assert_eq!(
+            extract_account_pin("/a/work"),
+            (Some("work".into()), "/".into())
+        );
+    }
 }
