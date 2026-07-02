@@ -174,14 +174,22 @@ pub async fn sync() -> Result<Vec<String>> {
     for (i, (account, home)) in homes.iter().enumerate() {
         let id = instance_id(account);
         let account_base = format!("{base}/a/{account}");
+        let home_str = home.to_string_lossy();
         let instance = serde_json::json!({
             "driver": "claudeAgent",
             "displayName": format!("claude · {account}"),
             "accentColor": ACCENTS[i % ACCENTS.len()],
             "enabled": true,
+            // homePath sets HOME per instance. t3code keys its per-instance auth
+            // display/capabilities cache on the resolved HOME, so a distinct
+            // homePath is what makes t3code SHOW distinct accounts (otherwise it
+            // collapses both instances onto one identity).
+            "config": { "homePath": home_str },
             "environment": [
-                // Own config dir → Claude Code authenticates + displays as this account.
-                { "name": "CLAUDE_CONFIG_DIR", "value": home.to_string_lossy(), "sensitive": false },
+                // Explicit config dir → sha-suffixed Keychain service that doesn't
+                // exist, so Claude Code uses this home's .credentials.json (correct
+                // account) instead of the shared default Keychain login.
+                { "name": "CLAUDE_CONFIG_DIR", "value": home_str, "sensitive": false },
                 // Proxy supplies the live per-account token for actual traffic.
                 { "name": "ANTHROPIC_BASE_URL", "value": account_base, "sensitive": false }
             ]
