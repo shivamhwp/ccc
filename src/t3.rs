@@ -50,7 +50,7 @@ const ACCENTS: [&str; 6] = [
 
 /// Seed a per-account home with a login so Claude Code displays the right
 /// account. Returns the home path. Enriches the store with fetched identity.
-async fn provision_home(account: &str, profile: &Profile) -> Result<PathBuf> {
+pub async fn provision_home(account: &str, profile: &Profile) -> Result<PathBuf> {
     // Resolve identity (email/org) — fetch it once if we don't have it yet.
     let mut email = profile.email.clone();
     let mut account_uuid = profile.account_uuid.clone();

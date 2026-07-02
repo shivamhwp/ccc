@@ -413,99 +413,24 @@ async fn cmd_run(name: &str, args: Vec<String>) -> Result<()> {
         .get(name)
         .cloned()
         .with_context(|| format!("no account named `{name}`"))?;
-    let is_default = store.default_profile.as_deref() == Some(name);
 
-    // Get a currently-valid token to seed the session's config dir with.
-    // Default account is owned by Claude Code's Keychain — read it as-is (don't
-    // refresh, to avoid rotating the user's main login). Others are ccc-owned:
-    // refresh from the store if near expiry.
-    let (access, refresh, expires_at, scopes, sub) = if is_default {
-        let v = store::read_keychain_login()
-            .context("reading the default account's login (run `claude` /login once)")?;
-        let s = |k: &str| {
-            v.get(k)
-                .and_then(|x| x.as_str())
-                .unwrap_or_default()
-                .to_string()
-        };
-        let scopes = v
-            .get("scopes")
-            .and_then(|x| x.as_array())
-            .map(|a| {
-                a.iter()
-                    .filter_map(|s| s.as_str().map(String::from))
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        (
-            s("accessToken"),
-            s("refreshToken"),
-            v.get("expiresAt").and_then(|x| x.as_i64()).unwrap_or(0),
-            scopes,
-            v.get("subscriptionType")
-                .and_then(|x| x.as_str())
-                .map(String::from),
-        )
-    } else {
-        let mut p = profile.clone();
-        if p.needs_refresh(120_000) && !p.refresh_token.is_empty() {
-            p = oauth::refresh(&p).await?;
-            let (n, pp) = (name.to_string(), p.clone());
-            Store::update(move |s| {
-                s.profiles.insert(n, pp);
-                Ok(())
-            })?;
-        }
-        (
-            p.access_token,
-            p.refresh_token,
-            p.expires_at,
-            p.scopes,
-            p.subscription_type,
-        )
-    };
+    if !daemon::is_running() {
+        anyhow::bail!("the ccc daemon is not running — run `ccc daemon start` first");
+    }
 
-    // Seed a per-account config dir Claude Code authenticates + displays from.
-    let home = paths::ccc_dir()?.join("homes").join(name);
-    std::fs::create_dir_all(&home)?;
-    paths::set_mode(&home, 0o700)?;
+    // Seed a per-account home exactly like the t3code integration: identity +
+    // credentials with a FAR-FUTURE expiry so Claude Code treats them as valid
+    // and never refreshes (hence never writes to the Keychain — that write is
+    // what pops the macOS "keychain cannot be found to store" dialog). The
+    // session's real traffic is authenticated by the proxy via the /a/<name>
+    // pin, so the seeded token doesn't need to be live.
+    let home = t3::provision_home(name, &profile).await?;
 
-    let claude_json = serde_json::json!({
-        "hasCompletedOnboarding": true,
-        "installMethod": "native",
-        "autoUpdates": false,
-        "oauthAccount": {
-            "emailAddress": profile.email,
-            "accountUuid": profile.account_uuid,
-            "organizationUuid": profile.organization_uuid,
-            "organizationName": profile.organization_name,
-            "organizationType": sub.as_ref().map(|s| format!("claude_{s}")),
-        }
-    });
-    std::fs::write(
-        home.join(".claude.json"),
-        serde_json::to_vec_pretty(&claude_json)?,
-    )?;
-
-    let cred = serde_json::json!({
-        "claudeAiOauth": {
-            "accessToken": access,
-            "refreshToken": refresh,
-            "expiresAt": expires_at,
-            "scopes": scopes,
-            "subscriptionType": sub.clone().unwrap_or_else(|| "max".into()),
-        }
-    });
-    let cp = home.join(".credentials.json");
-    std::fs::write(&cp, serde_json::to_vec(&cred)?)?;
-    paths::set_mode(&cp, 0o600)?;
-
+    let base = format!("{}/a/{name}", daemon::base_url());
     eprintln!("launching Claude Code as `{name}`…");
-    // Replace this process with claude, pointed at the account's config dir.
-    // Explicitly clear proxy env so this session authenticates directly.
     let err = std::process::Command::new("claude")
         .env("CLAUDE_CONFIG_DIR", &home)
-        .env_remove("ANTHROPIC_BASE_URL")
+        .env("ANTHROPIC_BASE_URL", &base)
         .env_remove("ANTHROPIC_AUTH_TOKEN")
         .args(&args)
         .exec();
