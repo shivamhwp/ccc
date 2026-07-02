@@ -20,7 +20,7 @@
 `ccc` keeps several Claude subscription accounts on one machine and switches which one a Claude Code thread uses — **per thread, live, no restarts**. Two threads can run two different accounts at the same time. Subscription auth only; no API keys are ever stored or used.
 
 > [!NOTE]
-> `ccc` is early software. macOS and Linux are fully supported today; Windows is experimental. See [Platform support](#platform-support).
+> `ccc` is early software. macOS, Linux, and Windows are all supported. See [Platform support](#platform-support).
 
 ## Install
 
@@ -32,7 +32,10 @@ curl -fsSL https://raw.githubusercontent.com/shivamhwp/ccc/main/scripts/install.
 cargo build --release        # → target/release/ccc
 ```
 
-On Windows, grab the `.zip` from [Releases](https://github.com/shivamhwp/ccc/releases) and put `ccc.exe` on your PATH.
+```powershell
+# Windows
+irm https://raw.githubusercontent.com/shivamhwp/ccc/main/scripts/install.ps1 | iex
+```
 
 ## Quickstart
 
@@ -99,20 +102,21 @@ Because selection happens per request, `ccc use <name>` changes the account for 
 |---|:---:|:---:|:---:|
 | macOS (arm64 / x64) | ✅ | ✅ | ✅ launchd |
 | Linux (x64) | ✅ | ✅ via `/proc` (no lsof needed) | ✅ systemd user unit* |
-| Windows (x64) | ✅ | 🧪 experimental | 🧪 experimental |
+| Windows (x64) | ✅ | ✅ via `netstat` | ✅ Run key (login, hidden) |
 
 \* On Linux hosts without a user systemd session (some WSL/container setups), `ccc daemon start` falls back to a detached background process — it runs immediately but won't restart after reboot.
 
 ## Testing
 
 ```sh
-cargo test           # unit: lsof + /proc/net/tcp parsing, PKCE, store/refresh, routing
-./scripts/smoke.sh   # end-to-end: proves auth + per-thread routing, then cleans up
+cargo test                    # unit: lsof + /proc/net/tcp + netstat parsing, PKCE, store/refresh, routing
+./scripts/smoke.sh            # end-to-end (macOS/Linux): proves auth + per-thread routing, then cleans up
+./scripts/smoke-windows.ps1   # end-to-end (Windows): autostart lifecycle + routing attribution (also runs in CI)
 ```
 
 ## Files & configuration
 
-State lives in `~/.ccc/`: `store.json` (accounts + subscription tokens, `0600`), `routes.json` (live PID → account), `daemon.json` (pid + port). The autostart agent lives at `~/Library/LaunchAgents/ing.shivam.ccc.plist` (macOS) or `~/.config/systemd/user/ccc.service` (Linux).
+State lives in `~/.ccc/`: `store.json` (accounts + subscription tokens, `0600`), `routes.json` (live PID → account), `daemon.json` (pid + port). The autostart agent lives at `~/Library/LaunchAgents/ing.shivam.ccc.plist` (macOS), `~/.config/systemd/user/ccc.service` (Linux), or the `ccc` value under `HKCU\...\CurrentVersion\Run` plus `~/.ccc/ccc-daemon.vbs` (Windows).
 
 OAuth endpoints and the upstream base are overridable via `CCC_OAUTH_*` and `CCC_UPSTREAM_BASE` env vars (useful if a Claude Code update moves an endpoint). Set `CCC_LOG=1` on the daemon for a per-request routing log.
 

@@ -3,11 +3,14 @@
 use anyhow::{anyhow, Result};
 use std::path::PathBuf;
 
-/// Home directory of the invoking user.
+/// Home directory of the invoking user. `HOME` everywhere, with the
+/// `USERPROFILE` fallback for Windows (where `HOME` is usually unset).
 pub fn home() -> Result<PathBuf> {
     std::env::var_os("HOME")
+        .filter(|v| !v.is_empty())
+        .or_else(|| std::env::var_os("USERPROFILE").filter(|v| !v.is_empty()))
         .map(PathBuf::from)
-        .ok_or_else(|| anyhow!("HOME is not set"))
+        .ok_or_else(|| anyhow!("neither HOME nor USERPROFILE is set"))
 }
 
 /// Root of ccc state: `~/.ccc`.

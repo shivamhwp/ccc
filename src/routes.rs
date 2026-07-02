@@ -41,6 +41,16 @@ impl Routes {
     /// Resolve the profile for a request originating from `claude_pid`, by
     /// checking `claude_pid` and each of its ancestors against the table.
     pub fn resolve_for(&self, claude_pid: u32) -> Option<String> {
+        // Fast paths first: building the ancestor chain costs a process-table
+        // scan (`ps` / PowerShell), which is pure waste when the table is
+        // empty and unnecessary on a direct hit — the common case, since
+        // requests come from the routed claude pid itself.
+        if self.routes.is_empty() {
+            return None;
+        }
+        if let Some(r) = self.routes.get(&claude_pid.to_string()) {
+            return Some(r.profile.clone());
+        }
         let chain = procinfo::ancestors(claude_pid);
         for pid in chain {
             if let Some(r) = self.routes.get(&pid.to_string()) {
