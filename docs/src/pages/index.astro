@@ -1,6 +1,8 @@
 ---
-import "@fontsource-variable/geist";
+import "@fontsource/micro-5";
 import "@fontsource-variable/geist-mono";
+
+const INSTALL = "curl -fsSL https://raw.githubusercontent.com/shivamhwp/ccc/main/scripts/install.sh | bash";
 
 const commands: [string, string][] = [
   ["ccc setup", "Wire up Claude Code: import your current login, start the proxy daemon, install the agent skill."],
@@ -27,14 +29,13 @@ const commands: [string, string][] = [
     <meta name="description" content="use two or more claude accounts on your device." />
   </head>
   <body>
-    <section class="hero">
-      <h1>ccc</h1>
-      <span class="scroll">↓</span>
-    </section>
+    <div class="wrap">
+      <header class="top">
+        <h1 class="logo">ccc</h1>
+        <button class="copy" data-cmd={INSTALL} aria-label="Copy install command">copy</button>
+      </header>
 
-    <main class="docs">
-      <h2>commands</h2>
-      <dl>
+      <dl class="commands">
         {commands.map(([cmd, desc]) => (
           <div class="row">
             <dt><code>{cmd}</code></dt>
@@ -42,81 +43,76 @@ const commands: [string, string][] = [
           </div>
         ))}
       </dl>
-    </main>
+    </div>
 
     <style is:global>
-      :root {
-        --fg: #000;
-        --bg: #fff;
-        --muted: #666;
-      }
+      :root { --fg: #000; --bg: #fff; --muted: #666; --line: #ececec; }
       * { box-sizing: border-box; margin: 0; padding: 0; }
-      html { scroll-behavior: smooth; }
       body {
         background: var(--bg);
         color: var(--fg);
-        font-family: "Geist Variable", system-ui, sans-serif;
+        font-family: "Geist Mono Variable", ui-monospace, monospace;
         -webkit-font-smoothing: antialiased;
         text-rendering: optimizeLegibility;
       }
 
-      .hero {
-        height: 100vh;
-        display: flex;
-        flex-direction: column;
-        align-items: center;
-        justify-content: center;
-        gap: 2rem;
-      }
-      .hero h1 {
-        font-size: clamp(5rem, 22vw, 16rem);
-        font-weight: 600;
-        letter-spacing: -0.04em;
-        line-height: 1;
-      }
-      .scroll {
-        font-size: 1.25rem;
-        color: var(--muted);
-        animation: bob 1.8s ease-in-out infinite;
-      }
-      @keyframes bob {
-        0%, 100% { transform: translateY(0); }
-        50% { transform: translateY(6px); }
-      }
-
-      .docs {
-        max-width: 720px;
+      .wrap {
+        max-width: 56rem; /* max-w-4xl */
         margin: 0 auto;
-        padding: 6rem 1.5rem 8rem;
-      }
-      .docs h2 {
-        font-size: 1rem;
-        font-weight: 500;
-        color: var(--muted);
-        text-transform: lowercase;
-        margin-bottom: 2.5rem;
-      }
-      dl { display: flex; flex-direction: column; }
-      .row {
-        padding: 1.1rem 0;
-        border-top: 1px solid #ececec;
-      }
-      dt {
-        font-family: "Geist Mono Variable", ui-monospace, monospace;
-        font-size: 0.95rem;
-        font-weight: 500;
-        margin-bottom: 0.35rem;
-      }
-      dd {
-        font-size: 0.95rem;
-        line-height: 1.5;
-        color: var(--muted);
+        padding: 4rem 1.5rem 6rem;
       }
 
-      @media (prefers-reduced-motion: reduce) {
-        .scroll { animation: none; }
-        html { scroll-behavior: auto; }
+      .top {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        margin-bottom: 3.5rem;
       }
+      .logo {
+        font-family: "Micro 5", "Geist Mono Variable", monospace;
+        font-weight: 400;
+        font-size: clamp(3.5rem, 9vw, 6rem);
+        line-height: 0.9;
+        letter-spacing: 0.02em;
+      }
+
+      .copy {
+        font-family: inherit;
+        font-size: 0.85rem;
+        color: var(--fg);
+        background: transparent;
+        border: 1px solid var(--fg);
+        border-radius: 6px;
+        padding: 0.45rem 0.9rem;
+        cursor: pointer;
+        transition: background 0.15s ease, color 0.15s ease;
+      }
+      .copy:hover { background: var(--fg); color: var(--bg); }
+      .copy.copied { background: var(--fg); color: var(--bg); }
+
+      .commands { display: flex; flex-direction: column; }
+      .row { padding: 1rem 0; border-top: 1px solid var(--line); }
+      dt { font-size: 0.9rem; font-weight: 500; margin-bottom: 0.35rem; }
+      dd { font-size: 0.9rem; line-height: 1.55; color: var(--muted); }
     </style>
+
+    <script>
+      const btn = document.querySelector<HTMLButtonElement>(".copy");
+      btn?.addEventListener("click", async () => {
+        const cmd = btn.dataset.cmd ?? "";
+        try {
+          await navigator.clipboard.writeText(cmd);
+          const prev = btn.textContent;
+          btn.textContent = "copied";
+          btn.classList.add("copied");
+          setTimeout(() => {
+            btn.textContent = prev;
+            btn.classList.remove("copied");
+          }, 1400);
+        } catch {
+          /* clipboard unavailable */
+        }
+      });
+    </script>
   </body>
 </html>
