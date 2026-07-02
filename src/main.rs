@@ -145,14 +145,14 @@ async fn run() -> Result<()> {
             DaemonAction::Status => cmd_daemon_status(),
         },
         Command::T3 { action } => match action {
-            T3Action::Sync => cmd_t3_sync(),
+            T3Action::Sync => cmd_t3_sync().await,
             T3Action::Unsync => cmd_t3_unsync(),
         },
     }
 }
 
-fn cmd_t3_sync() -> Result<()> {
-    let ids = t3::sync()?;
+async fn cmd_t3_sync() -> Result<()> {
+    let ids = t3::sync().await?;
     println!("✓ synced {} account(s) into t3code:", ids.len());
     for id in &ids {
         println!("    {id}");

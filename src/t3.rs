@@ -6,23 +6,37 @@
 //! optional `displayName`/`accentColor`, and an `environment` array that t3code
 //! merges into the spawned agent process.
 //!
-//! `ccc t3 sync` writes one instance per ccc account, each pinned to its account
-//! via `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>/a/<account>`. The proxy reads
-//! that `/a/<account>` prefix and authenticates as that account — so in t3code
-//! the account becomes a per-instance choice in the UI, no PID routing needed.
+//! `ccc t3 sync` writes one instance per ccc account. Each instance gets its own
+//! `CLAUDE_CONFIG_DIR` home seeded with that account's login (so t3code shows the
+//! correct account + subscription — not "API key"), plus
+//! `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>/a/<account>` so the proxy supplies
+//! the live, per-account token. The seeded credentials carry a far-future expiry
+//! so Claude Code never refreshes them (the proxy owns the real token) — avoiding
+//! any refresh-rotation conflict.
 
 use anyhow::{Context, Result};
 use std::io::Write;
+use std::path::PathBuf;
 
 use crate::daemon;
+use crate::oauth;
 use crate::paths;
-use crate::store::Store;
+use crate::store::{Profile, Store};
 
-fn t3_settings_file() -> Result<std::path::PathBuf> {
+/// A far-future expiry (year 2100) so Claude Code treats the seeded token as
+/// valid and never tries to refresh it. Actual traffic is re-authed by the proxy.
+const FAR_FUTURE_MS: i64 = 4_102_444_800_000;
+
+fn t3_settings_file() -> Result<PathBuf> {
     if let Some(p) = std::env::var_os("CCC_T3_SETTINGS") {
-        return Ok(std::path::PathBuf::from(p));
+        return Ok(PathBuf::from(p));
     }
     Ok(paths::home()?.join(".t3/userdata/settings.json"))
+}
+
+/// Per-account Claude config-dir home used by t3code instances.
+fn account_home(account: &str) -> Result<PathBuf> {
+    Ok(paths::ccc_dir()?.join("homes").join(account))
 }
 
 /// Instance id we use for a given ccc account.
@@ -34,8 +48,86 @@ const ACCENTS: [&str; 6] = [
     "#2563eb", "#7c3aed", "#059669", "#d97706", "#dc2626", "#0891b2",
 ];
 
+/// Seed a per-account home with a login so Claude Code displays the right
+/// account. Returns the home path. Enriches the store with fetched identity.
+async fn provision_home(account: &str, profile: &Profile) -> Result<PathBuf> {
+    // Resolve identity (email/org) — fetch it once if we don't have it yet.
+    let mut email = profile.email.clone();
+    let mut account_uuid = profile.account_uuid.clone();
+    let mut org_uuid = profile.organization_uuid.clone();
+    let mut org_name = profile.organization_name.clone();
+    let mut sub = profile.subscription_type.clone();
+    if email.is_none() || org_name.is_none() {
+        if let Ok(info) = oauth::fetch_profile(&profile.access_token).await {
+            email = email.or(info.email);
+            account_uuid = account_uuid.or(info.account_uuid);
+            org_uuid = org_uuid.or(info.organization_uuid);
+            org_name = org_name.or(info.organization_name);
+            sub = sub.or(info.subscription_type);
+            // Persist enrichment so `ccc list` etc. show it too.
+            let (a, e, au, ou, on, s) = (
+                account.to_string(),
+                email.clone(),
+                account_uuid.clone(),
+                org_uuid.clone(),
+                org_name.clone(),
+                sub.clone(),
+            );
+            let _ = Store::update(move |st| {
+                if let Some(p) = st.profiles.get_mut(&a) {
+                    p.email = e;
+                    p.account_uuid = au;
+                    p.organization_uuid = ou;
+                    p.organization_name = on;
+                    p.subscription_type = s;
+                }
+                Ok(())
+            });
+        }
+    }
+
+    let home = account_home(account)?;
+    std::fs::create_dir_all(&home)?;
+    paths::set_mode(&home, 0o700)?;
+
+    // .claude.json — identity Claude Code shows immediately (before any fetch).
+    let claude_json = serde_json::json!({
+        "hasCompletedOnboarding": true,
+        "installMethod": "native",
+        "autoUpdates": false,
+        "oauthAccount": {
+            "emailAddress": email,
+            "accountUuid": account_uuid,
+            "organizationUuid": org_uuid,
+            "organizationName": org_name,
+            "organizationType": sub.as_ref().map(|s| format!("claude_{s}")),
+        }
+    });
+    std::fs::write(
+        home.join(".claude.json"),
+        serde_json::to_vec_pretty(&claude_json)?,
+    )?;
+
+    // .credentials.json — satisfies the auth gate + drives the subscription
+    // display; far-future expiry so Claude Code never refreshes it.
+    let cred = serde_json::json!({
+        "claudeAiOauth": {
+            "accessToken": profile.access_token,
+            "refreshToken": profile.refresh_token,
+            "expiresAt": FAR_FUTURE_MS,
+            "scopes": profile.scopes,
+            "subscriptionType": sub.clone().unwrap_or_else(|| "max".into()),
+        }
+    });
+    let cred_path = home.join(".credentials.json");
+    std::fs::write(&cred_path, serde_json::to_vec(&cred)?)?;
+    paths::set_mode(&cred_path, 0o600)?;
+
+    Ok(home)
+}
+
 /// Upsert one t3code provider instance per ccc account. Returns the ids written.
-pub fn sync() -> Result<Vec<String>> {
+pub async fn sync() -> Result<Vec<String>> {
     let store = Store::load()?;
     if store.profiles.is_empty() {
         anyhow::bail!("no ccc accounts saved yet (run `ccc login <name>` or `ccc import`)");
@@ -50,6 +142,13 @@ pub fn sync() -> Result<Vec<String>> {
     }
 
     let base = daemon::base_url(); // http://127.0.0.1:<port>
+
+    // Provision homes first (may fetch identity + persist to store).
+    let mut homes = Vec::new();
+    for (account, profile) in &store.profiles {
+        let home = provision_home(account, profile).await?;
+        homes.push((account.clone(), home));
+    }
 
     let bytes = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
     let mut root: serde_json::Value =
@@ -72,20 +171,19 @@ pub fn sync() -> Result<Vec<String>> {
     let instances = instances.as_object_mut().unwrap();
 
     let mut written = Vec::new();
-    for (i, account) in store.profiles.keys().enumerate() {
+    for (i, (account, home)) in homes.iter().enumerate() {
         let id = instance_id(account);
         let account_base = format!("{base}/a/{account}");
-        let display = format!("claude · {account}");
         let instance = serde_json::json!({
             "driver": "claudeAgent",
-            "displayName": display,
+            "displayName": format!("claude · {account}"),
             "accentColor": ACCENTS[i % ACCENTS.len()],
             "enabled": true,
             "environment": [
-                { "name": "ANTHROPIC_BASE_URL", "value": account_base, "sensitive": false },
-                // Placeholder to satisfy Claude Code's local auth gate; the proxy
-                // overwrites the Authorization header with the real token.
-                { "name": "ANTHROPIC_AUTH_TOKEN", "value": "ccc-managed-by-proxy", "sensitive": false }
+                // Own config dir → Claude Code authenticates + displays as this account.
+                { "name": "CLAUDE_CONFIG_DIR", "value": home.to_string_lossy(), "sensitive": false },
+                // Proxy supplies the live per-account token for actual traffic.
+                { "name": "ANTHROPIC_BASE_URL", "value": account_base, "sensitive": false }
             ]
         });
         instances.insert(id.clone(), instance);
@@ -123,5 +221,10 @@ pub fn unsync() -> Result<usize> {
     }
     let data = serde_json::to_vec_pretty(&root)?;
     std::fs::write(&path, data)?;
+
+    // Remove the seeded per-account homes (they contain credentials).
+    if let Ok(homes) = paths::ccc_dir().map(|d| d.join("homes")) {
+        let _ = std::fs::remove_dir_all(homes);
+    }
     Ok(removed)
 }

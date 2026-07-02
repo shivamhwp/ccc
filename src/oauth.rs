@@ -184,6 +184,49 @@ fn http_client() -> Result<reqwest::Client> {
         .context("building HTTP client")
 }
 
+/// Account identity resolved from an access token via the OAuth profile endpoint.
+#[derive(Debug, Default, Clone)]
+pub struct ProfileInfo {
+    pub email: Option<String>,
+    pub account_uuid: Option<String>,
+    pub organization_uuid: Option<String>,
+    pub organization_name: Option<String>,
+    pub subscription_type: Option<String>,
+}
+
+/// Fetch the account identity behind an access token (GET /api/oauth/profile).
+pub async fn fetch_profile(access_token: &str) -> Result<ProfileInfo> {
+    let url = format!("{}/api/oauth/profile", oauthcfg::upstream_base());
+    let client = http_client()?;
+    let resp = client
+        .get(url)
+        .bearer_auth(access_token)
+        .header("anthropic-beta", oauthcfg::OAUTH_BETA)
+        .send()
+        .await
+        .context("fetching /api/oauth/profile")?;
+    if !resp.status().is_success() {
+        return Err(anyhow!("profile endpoint returned {}", resp.status()));
+    }
+    let v: serde_json::Value = resp.json().await.context("parsing profile json")?;
+    let acc = v.get("account");
+    let org = v.get("organization");
+    let get = |o: Option<&serde_json::Value>, k: &str| {
+        o.and_then(|x| x.get(k))
+            .and_then(|s| s.as_str())
+            .map(str::to_string)
+    };
+    Ok(ProfileInfo {
+        email: get(acc, "email_address").or_else(|| get(acc, "email")),
+        account_uuid: get(acc, "uuid"),
+        organization_uuid: get(org, "uuid"),
+        organization_name: get(org, "name"),
+        // Anthropic encodes the tier in organization_type e.g. "claude_max".
+        subscription_type: get(org, "organization_type")
+            .map(|t| t.trim_start_matches("claude_").to_string()),
+    })
+}
+
 fn rand_b64url(bytes: usize) -> String {
     let mut buf = vec![0u8; bytes];
     rand::thread_rng().fill_bytes(&mut buf);
