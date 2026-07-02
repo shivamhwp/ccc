@@ -1,8 +1,10 @@
 //! Process introspection used for per-thread routing.
 //!
-//! Two primitives, both via always-present macOS/Unix CLIs to avoid unsafe FFI:
+//! Two primitives, via CLIs / procfs to avoid unsafe FFI:
 //!   - `pid_owning_local_port`: which process owns a loopback TCP source port
 //!     (used by the proxy to attribute an inbound connection to a claude PID).
+//!     On Linux this reads `/proc` directly (no external tools needed) and
+//!     falls back to `lsof`; elsewhere it uses `lsof`.
 //!   - `ancestors`: the PID chain up to the session, and `find_claude_ancestor`
 //!     (used by `ccc use` to discover the claude process that owns the shell it
 //!     was invoked from).
@@ -10,8 +12,17 @@
 use std::collections::HashMap;
 
 /// Return the pid whose socket has `port` as its *local* port, excluding
-/// `exclude` (the daemon's own pid). Uses `lsof` machine-readable field output.
+/// `exclude` (the daemon's own pid).
 pub fn pid_owning_local_port(port: u16, exclude: u32) -> Option<u32> {
+    #[cfg(target_os = "linux")]
+    if let Some(pid) = procfs_pid_owning_local_port(port, exclude) {
+        return Some(pid);
+    }
+    lsof_pid_owning_local_port(port, exclude)
+}
+
+/// `lsof`-based lookup, using machine-readable field output.
+fn lsof_pid_owning_local_port(port: u16, exclude: u32) -> Option<u32> {
     // `lsof -nP -iTCP:PORT` lists both endpoints of the loopback connection:
     // the client (claude) whose local port == PORT, and the daemon whose
     // remote port == PORT. We want the one that is not us.
@@ -56,6 +67,69 @@ fn parse_owner_from_lsof(output: &str, port: u16, exclude: u32) -> Option<u32> {
                 }
             }
             _ => {}
+        }
+    }
+    None
+}
+
+/// Linux: resolve the owning pid via procfs, with no external tools.
+/// 1. `/proc/net/tcp` (+`tcp6`): find the ESTABLISHED socket whose *local*
+///    port is `port` → its socket inode.
+/// 2. Scan `/proc/<pid>/fd/*` symlinks for `socket:[inode]` → pid.
+#[cfg(target_os = "linux")]
+fn procfs_pid_owning_local_port(port: u16, exclude: u32) -> Option<u32> {
+    let inode = ["/proc/net/tcp", "/proc/net/tcp6"]
+        .iter()
+        .filter_map(|p| std::fs::read_to_string(p).ok())
+        .find_map(|text| parse_inode_from_proc_net_tcp(&text, port))?;
+    find_pid_by_socket_inode(inode, exclude)
+}
+
+/// Pure parser for `/proc/net/tcp` content: the socket inode of the
+/// ESTABLISHED connection whose local port equals `port`. The daemon's own
+/// sockets never match: its listener's local port is the daemon port, and its
+/// accepted sockets have the ephemeral port on the *remote* side.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn parse_inode_from_proc_net_tcp(text: &str, port: u16) -> Option<u64> {
+    // Format (whitespace-separated, after a header line):
+    //   sl local_address rem_address st tx:rx tr:tm retrnsmt uid timeout inode …
+    // Addresses are HEXIP:HEXPORT; st 01 = ESTABLISHED.
+    for line in text.lines().skip(1) {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        if f.len() < 10 || f[3] != "01" {
+            continue;
+        }
+        let local_port = f[1]
+            .rsplit(':')
+            .next()
+            .and_then(|h| u16::from_str_radix(h, 16).ok());
+        if local_port == Some(port) {
+            return f[9].parse::<u64>().ok();
+        }
+    }
+    None
+}
+
+/// Scan `/proc/<pid>/fd` symlinks for `socket:[inode]`. Only same-user
+/// processes are readable, which is exactly the set we can route anyway.
+#[cfg(target_os = "linux")]
+fn find_pid_by_socket_inode(inode: u64, exclude: u32) -> Option<u32> {
+    let needle = format!("socket:[{inode}]");
+    for entry in std::fs::read_dir("/proc").ok()?.flatten() {
+        let pid: u32 = match entry.file_name().to_str().and_then(|s| s.parse().ok()) {
+            Some(p) if p != exclude => p,
+            _ => continue,
+        };
+        let fd_dir = entry.path().join("fd");
+        let Ok(fds) = std::fs::read_dir(&fd_dir) else {
+            continue;
+        };
+        for fd in fds.flatten() {
+            if let Ok(target) = std::fs::read_link(fd.path()) {
+                if target.as_os_str() == needle.as_str() {
+                    return Some(pid);
+                }
+            }
         }
     }
     None
@@ -154,6 +228,16 @@ fn is_claude_command(command: &str) -> bool {
     false
 }
 
+/// The full command line of a process, or empty if it can't be read. Used as
+/// a pid-reuse guard before killing a recorded daemon pid.
+#[cfg(target_os = "linux")]
+pub fn command_of(pid: u32) -> String {
+    process_table()
+        .get(&pid)
+        .map(|(_, cmd)| cmd.clone())
+        .unwrap_or_default()
+}
+
 /// True if a process with this pid currently exists.
 pub fn pid_alive(pid: u32) -> bool {
     // signal 0 checks existence without delivering a signal.
@@ -193,6 +277,25 @@ mod tests {
     fn no_match_returns_none() {
         let out = "p111\nn127.0.0.1:50123->127.0.0.1:8791\n";
         assert_eq!(parse_owner_from_lsof(out, 40000, 999), None);
+    }
+
+    #[test]
+    fn proc_net_tcp_finds_established_local_port() {
+        // Client socket: local 127.0.0.1:50123 (C4AB) -> 127.0.0.1:8791 (2257),
+        // ESTABLISHED (st 01), inode 4242. Plus the daemon's listener (st 0A)
+        // and a TIME_WAIT ghost (st 06) on the same port that must be skipped.
+        let text = "\
+  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
+   0: 0100007F:2257 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 1111 1 0 100 0 0 10 0
+   1: 0100007F:C4AB 0100007F:2257 06 00000000:00000000 00:00000000 00000000  1000        0 0 1 0 100 0 0 10 0
+   2: 0100007F:C4AB 0100007F:2257 01 00000000:00000000 00:00000000 00000000  1000        0 4242 1 0 100 0 0 10 0
+";
+        assert_eq!(parse_inode_from_proc_net_tcp(text, 0xC4AB), Some(4242));
+        // Daemon listener port doesn't match as a client-local port…
+        // (st 0A = LISTEN, filtered out)
+        assert_eq!(parse_inode_from_proc_net_tcp(text, 0x2257), None);
+        // …and an unknown port finds nothing.
+        assert_eq!(parse_inode_from_proc_net_tcp(text, 0x1234), None);
     }
 
     #[test]
