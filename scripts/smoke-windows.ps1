@@ -49,7 +49,7 @@ $daemon = Start-Process $ccc -ArgumentList "daemon", "run", "--port", "8788" `
 Wait-Health 8788
 
 Say "sending a request through the proxy"
-& curl.exe -s -o NUL "http://127.0.0.1:8788/v1/models"
+& curl.exe -s -o NUL --max-time 30 "http://127.0.0.1:8788/v1/models"
 Start-Sleep -Milliseconds 500
 
 $log = Get-Content $logErr -Raw -ErrorAction SilentlyContinue
