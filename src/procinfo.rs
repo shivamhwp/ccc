@@ -61,11 +61,13 @@ fn parse_owner_from_lsof(output: &str, port: u16, exclude: u32) -> Option<u32> {
     None
 }
 
-/// Map of pid -> (ppid, command name) for all processes, via one `ps` call.
+/// Map of pid -> (ppid, full command line) for all processes, via one `ps`
+/// call. The full command (not just `comm`) is needed to recognize npm/`node`
+/// and `bun` installs of Claude Code, where `comm` is `node`/`bun`.
 fn process_table() -> HashMap<u32, (u32, String)> {
     let mut map = HashMap::new();
     if let Ok(out) = std::process::Command::new("ps")
-        .args(["-Ao", "pid=,ppid=,comm="])
+        .args(["-Ao", "pid=,ppid=,command="])
         .output()
     {
         let text = String::from_utf8_lossy(&out.stdout);
@@ -73,8 +75,8 @@ fn process_table() -> HashMap<u32, (u32, String)> {
             let mut it = line.split_whitespace();
             if let (Some(pid), Some(ppid)) = (it.next(), it.next()) {
                 if let (Ok(pid), Ok(ppid)) = (pid.parse::<u32>(), ppid.parse::<u32>()) {
-                    let comm = it.collect::<Vec<_>>().join(" ");
-                    map.insert(pid, (ppid, comm));
+                    let command = it.collect::<Vec<_>>().join(" ");
+                    map.insert(pid, (ppid, command));
                 }
             }
         }
@@ -112,8 +114,8 @@ pub fn find_claude_ancestor(start: u32) -> Option<u32> {
     let mut cur = start;
     let mut guard = 0;
     while cur > 1 && guard < 64 {
-        if let Some((ppid, comm)) = table.get(&cur) {
-            if is_claude_comm(comm) {
+        if let Some((ppid, command)) = table.get(&cur) {
+            if is_claude_command(command) {
                 return Some(cur);
             }
             cur = *ppid;
@@ -125,12 +127,31 @@ pub fn find_claude_ancestor(start: u32) -> Option<u32> {
     None
 }
 
-fn is_claude_comm(comm: &str) -> bool {
-    let base = comm.rsplit('/').next().unwrap_or(comm);
-    // The native installer runs a binary literally named `claude`; the npm
-    // install runs under `node`/`bun` with `claude` in argv (not visible in
-    // comm). We match the common native case here; --pid overrides otherwise.
-    base == "claude" || base.starts_with("claude")
+/// Heuristic: does this full command line belong to the Claude Code CLI?
+/// Covers the native binary (`.../claude`), npm/`node` installs
+/// (`node .../@anthropic-ai/claude-code/cli.js`), and `bun` installs.
+fn is_claude_command(command: &str) -> bool {
+    // First whitespace-separated token is the executable (argv0).
+    let argv0 = command.split_whitespace().next().unwrap_or(command);
+    let exe = argv0.rsplit('/').next().unwrap_or(argv0);
+
+    // Native install: the executable itself is `claude`.
+    if exe == "claude" {
+        return true;
+    }
+    // npm / bun installs run under node/bun with the CLI path in argv. Match
+    // on the distinctive package path rather than a bare "claude" substring so
+    // we don't misfire on unrelated processes that merely mention the word.
+    let runner = matches!(exe, "node" | "bun" | "node.js" | "deno");
+    if runner
+        && (command.contains("@anthropic-ai/claude-code")
+            || command.contains("claude-code/cli")
+            || command.contains(".claude/local/")
+            || command.contains("/claude-code/"))
+    {
+        return true;
+    }
+    false
 }
 
 /// True if a process with this pid currently exists.
@@ -172,5 +193,31 @@ mod tests {
     fn no_match_returns_none() {
         let out = "p111\nn127.0.0.1:50123->127.0.0.1:8791\n";
         assert_eq!(parse_owner_from_lsof(out, 40000, 999), None);
+    }
+
+    #[test]
+    fn detects_native_and_npm_installs() {
+        // native binary
+        assert!(is_claude_command("/Users/x/.local/bin/claude -p hi"));
+        assert!(is_claude_command("claude"));
+        // npm / node install
+        assert!(is_claude_command(
+            "node /Users/x/n/lib/node_modules/@anthropic-ai/claude-code/cli.js"
+        ));
+        // bun install
+        assert!(is_claude_command(
+            "bun /Users/x/.bun/install/global/node_modules/claude-code/cli.js"
+        ));
+        // local install path
+        assert!(is_claude_command("node /Users/x/.claude/local/cli.js"));
+    }
+
+    #[test]
+    fn does_not_misfire_on_unrelated() {
+        assert!(!is_claude_command("/opt/homebrew/bin/fish"));
+        assert!(!is_claude_command("ccc use work --pid 123"));
+        assert!(!is_claude_command("node /Users/x/some/other/app.js"));
+        // a shell that merely mentions the word in an argument shouldn't match
+        assert!(!is_claude_command("bash -c echo claude"));
     }
 }

@@ -61,8 +61,7 @@ pub fn patch_settings(base_url: &str) -> Result<String> {
     Ok(base_url.to_string())
 }
 
-/// Remove the ANTHROPIC_BASE_URL override we added (leaves other settings).
-#[allow(dead_code)] // used by a future `ccc teardown`
+/// Remove the env overrides we added (leaves all other settings intact).
 pub fn unpatch_settings() -> Result<()> {
     let path = paths::claude_settings_file()?;
     let bytes = match std::fs::read(&path) {
@@ -72,6 +71,11 @@ pub fn unpatch_settings() -> Result<()> {
     let mut root: serde_json::Value = serde_json::from_slice(&bytes)?;
     if let Some(env) = root.get_mut("env").and_then(|e| e.as_object_mut()) {
         env.remove("ANTHROPIC_BASE_URL");
+        // Only remove the auth token if it's our placeholder.
+        if env.get("ANTHROPIC_AUTH_TOKEN").and_then(|v| v.as_str()) == Some("ccc-managed-by-proxy")
+        {
+            env.remove("ANTHROPIC_AUTH_TOKEN");
+        }
     }
     let data = serde_json::to_vec_pretty(&root)?;
     std::fs::write(&path, data)?;
@@ -125,6 +129,15 @@ pub fn install_skill() -> Result<std::path::PathBuf> {
     let path = dir.join("SKILL.md");
     std::fs::write(&path, SKILL_BODY)?;
     Ok(path)
+}
+
+/// Remove the ccc skill directory from Claude Code.
+pub fn remove_skill() -> Result<()> {
+    let dir = paths::claude_dir()?.join("skills").join("ccc");
+    if dir.exists() {
+        std::fs::remove_dir_all(&dir)?;
+    }
+    Ok(())
 }
 
 /// The base URL ccc will write into settings.json (the running daemon's, or the

@@ -11,11 +11,12 @@ pub fn client_id() -> String {
     )
 }
 
-/// claude.ai subscription authorize endpoint.
+/// claude.ai subscription authorize endpoint. Value taken from the current
+/// Claude Code binary's production config (`CLAUDE_AI_AUTHORIZE_URL`).
 pub fn authorize_url() -> String {
     env_or(
         "CCC_OAUTH_AUTHORIZE_URL",
-        "https://claude.ai/oauth/authorize",
+        "https://claude.com/cai/oauth/authorize",
     )
 }
 

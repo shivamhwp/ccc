@@ -65,6 +65,8 @@ enum Command {
     Default { name: String },
     /// Remove a saved account.
     Remove { name: String },
+    /// Undo `ccc setup`: revert settings.json, remove the skill, stop the daemon.
+    Teardown,
     /// Diagnostics: verify the daemon, settings, and auth path.
     Doctor,
     /// Daemon control.
@@ -124,6 +126,7 @@ async fn run() -> Result<()> {
         Command::Use { name, default, pid } => cmd_use(name, default, pid),
         Command::Default { name } => cmd_default(&name),
         Command::Remove { name } => cmd_remove(&name),
+        Command::Teardown => cmd_teardown(),
         Command::Doctor => cmd_doctor().await,
         Command::Daemon { action } => match action {
             DaemonAction::Run { port } => proxy::run(port).await,
@@ -265,7 +268,6 @@ fn cmd_import(name: &str) -> Result<()> {
             .and_then(|v| v.as_str())
             .map(str::to_string);
     }
-    let email = profile.email.clone().unwrap_or_else(|| "unknown".into());
     let name_owned = name.to_string();
     Store::update(move |s| {
         let first = s.profiles.is_empty();
@@ -275,7 +277,7 @@ fn cmd_import(name: &str) -> Result<()> {
         }
         Ok(())
     })?;
-    println!("✓ imported current Claude login as `{name}` ({email})");
+    println!("✓ imported current Claude login as `{name}`");
     Ok(())
 }
 
@@ -286,17 +288,16 @@ fn cmd_list() -> Result<()> {
         return Ok(());
     }
     let default = store.resolve_default().map(str::to_string);
-    println!("{:<16} {:<28} {:<10}", "PROFILE", "EMAIL", "PLAN");
+    println!("{:<18} {:<10}", "PROFILE", "PLAN");
     for (name, p) in &store.profiles {
         let marker = if default.as_deref() == Some(name.as_str()) {
             "* (default)"
         } else {
             ""
         };
-        let email = p.email.clone().unwrap_or_else(|| "—".into());
         let plan = p.subscription_type.clone().unwrap_or_else(|| "—".into());
         let expired = if p.needs_refresh(0) { " [expired]" } else { "" };
-        println!("{name:<16} {email:<28} {plan:<10} {marker}{expired}");
+        println!("{name:<18} {plan:<10} {marker}{expired}");
     }
     Ok(())
 }
@@ -315,17 +316,10 @@ fn cmd_whoami() -> Result<()> {
     };
 
     match profile {
-        Some(name) => {
-            let email = store
-                .profiles
-                .get(&name)
-                .and_then(|p| p.email.clone())
-                .unwrap_or_else(|| "unknown".into());
-            match claude {
-                Some(pid) => println!("this thread (claude pid {pid}) → {name} ({email})"),
-                None => println!("no claude thread detected; default account → {name} ({email})"),
-            }
-        }
+        Some(name) => match claude {
+            Some(pid) => println!("this thread (claude pid {pid}) → {name}"),
+            None => println!("no claude thread detected; default account → {name}"),
+        },
         None => println!("no account resolved (no route and no default set)"),
     }
     Ok(())
@@ -393,6 +387,23 @@ fn cmd_remove(name: &str) -> Result<()> {
         Ok(())
     })?;
     println!("✓ removed `{name}`");
+    Ok(())
+}
+
+fn cmd_teardown() -> Result<()> {
+    setup::unpatch_settings()?;
+    println!("✓ reverted Claude Code settings.json");
+    setup::remove_skill()?;
+    println!("✓ removed agent skill");
+    match t3::unsync() {
+        Ok(n) if n > 0 => println!("✓ removed {n} ccc instance(s) from t3code"),
+        _ => {}
+    }
+    match daemon::uninstall_launchd() {
+        Ok(()) => println!("✓ stopped daemon"),
+        Err(e) => eprintln!("note: could not stop daemon ({e:#})"),
+    }
+    println!("\nDone. Saved accounts remain in ~/.ccc (delete it to remove them).");
     Ok(())
 }
 

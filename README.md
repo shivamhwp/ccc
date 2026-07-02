@@ -63,6 +63,8 @@ That's it — the account is live for that thread within a couple of seconds, an
 | `ccc remove <name>` | Remove a saved account |
 | `ccc doctor` | Verify daemon, settings, and auth path |
 | `ccc daemon run \| start \| stop \| status` | Control the local proxy daemon |
+| `ccc t3 sync \| unsync` | Add/remove one [t3code](https://github.com/pingdotgg/t3code) provider instance per account |
+| `ccc teardown` | Undo `ccc setup` (revert settings, remove skill, stop daemon) |
 
 ## How it works
 
@@ -85,7 +87,11 @@ Because selection happens per request, `ccc use <name>` changes the account for 
 
 ## For your agents
 
-`ccc setup` installs a skill at `~/.claude/skills/ccc/` that teaches Claude Code agents what "using ccc, use the &lt;name&gt; account" means — they run `ccc use <name>` for you, then carry on with the task.
+`ccc setup` installs a skill at `~/.claude/skills/ccc/` that teaches Claude Code agents what "using ccc, use the &lt;name&gt; account" means — they run `ccc use <name>` for you, then carry on with the task. Detection covers the native binary as well as `node`/`bun` (npm) installs of Claude Code.
+
+## t3code
+
+`ccc t3 sync` adds one [t3code](https://github.com/pingdotgg/t3code) provider instance per account (`claude · <name>`), each pinned to its account. In t3code you then just pick the provider for a thread — no per-thread routing needed there. `ccc t3 unsync` removes them. Your existing t3code instances are left untouched (and the file is backed up first).
 
 ## Platform support
 
