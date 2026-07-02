@@ -67,6 +67,16 @@ enum Command {
         #[arg(long)]
         pid: Option<u32>,
     },
+    /// Launch Claude Code as a specific account (like codex-p / codex-vm).
+    /// The whole session uses that account — /status and traffic both read
+    /// correctly. Chosen at launch (no live in-thread switching).
+    Run {
+        /// Account to launch as.
+        name: String,
+        /// Extra arguments passed through to `claude`.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
     /// Set the default account (used by threads with no explicit route).
     Default { name: String },
     /// Remove a saved account.
@@ -134,6 +144,7 @@ async fn run() -> Result<()> {
         Command::List => cmd_list(),
         Command::Whoami => cmd_whoami(),
         Command::Use { name, default, pid } => cmd_use(name, default, pid),
+        Command::Run { name, args } => cmd_run(&name, args).await,
         Command::Default { name } => cmd_default(&name),
         Command::Remove { name } => cmd_remove(&name),
         Command::Teardown => cmd_teardown(),
@@ -391,6 +402,114 @@ fn cmd_whoami() -> Result<()> {
         None => println!("no account resolved (no route and no default set)"),
     }
     Ok(())
+}
+
+async fn cmd_run(name: &str, args: Vec<String>) -> Result<()> {
+    use std::os::unix::process::CommandExt;
+
+    let store = Store::load()?;
+    let profile = store
+        .profiles
+        .get(name)
+        .cloned()
+        .with_context(|| format!("no account named `{name}`"))?;
+    let is_default = store.default_profile.as_deref() == Some(name);
+
+    // Get a currently-valid token to seed the session's config dir with.
+    // Default account is owned by Claude Code's Keychain — read it as-is (don't
+    // refresh, to avoid rotating the user's main login). Others are ccc-owned:
+    // refresh from the store if near expiry.
+    let (access, refresh, expires_at, scopes, sub) = if is_default {
+        let v = store::read_keychain_login()
+            .context("reading the default account's login (run `claude` /login once)")?;
+        let s = |k: &str| {
+            v.get(k)
+                .and_then(|x| x.as_str())
+                .unwrap_or_default()
+                .to_string()
+        };
+        let scopes = v
+            .get("scopes")
+            .and_then(|x| x.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|s| s.as_str().map(String::from))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        (
+            s("accessToken"),
+            s("refreshToken"),
+            v.get("expiresAt").and_then(|x| x.as_i64()).unwrap_or(0),
+            scopes,
+            v.get("subscriptionType")
+                .and_then(|x| x.as_str())
+                .map(String::from),
+        )
+    } else {
+        let mut p = profile.clone();
+        if p.needs_refresh(120_000) && !p.refresh_token.is_empty() {
+            p = oauth::refresh(&p).await?;
+            let (n, pp) = (name.to_string(), p.clone());
+            Store::update(move |s| {
+                s.profiles.insert(n, pp);
+                Ok(())
+            })?;
+        }
+        (
+            p.access_token,
+            p.refresh_token,
+            p.expires_at,
+            p.scopes,
+            p.subscription_type,
+        )
+    };
+
+    // Seed a per-account config dir Claude Code authenticates + displays from.
+    let home = paths::ccc_dir()?.join("homes").join(name);
+    std::fs::create_dir_all(&home)?;
+    paths::set_mode(&home, 0o700)?;
+
+    let claude_json = serde_json::json!({
+        "hasCompletedOnboarding": true,
+        "installMethod": "native",
+        "autoUpdates": false,
+        "oauthAccount": {
+            "emailAddress": profile.email,
+            "accountUuid": profile.account_uuid,
+            "organizationUuid": profile.organization_uuid,
+            "organizationName": profile.organization_name,
+            "organizationType": sub.as_ref().map(|s| format!("claude_{s}")),
+        }
+    });
+    std::fs::write(
+        home.join(".claude.json"),
+        serde_json::to_vec_pretty(&claude_json)?,
+    )?;
+
+    let cred = serde_json::json!({
+        "claudeAiOauth": {
+            "accessToken": access,
+            "refreshToken": refresh,
+            "expiresAt": expires_at,
+            "scopes": scopes,
+            "subscriptionType": sub.clone().unwrap_or_else(|| "max".into()),
+        }
+    });
+    let cp = home.join(".credentials.json");
+    std::fs::write(&cp, serde_json::to_vec(&cred)?)?;
+    paths::set_mode(&cp, 0o600)?;
+
+    eprintln!("launching Claude Code as `{name}`…");
+    // Replace this process with claude, pointed at the account's config dir.
+    // Explicitly clear proxy env so this session authenticates directly.
+    let err = std::process::Command::new("claude")
+        .env("CLAUDE_CONFIG_DIR", &home)
+        .env_remove("ANTHROPIC_BASE_URL")
+        .env_remove("ANTHROPIC_AUTH_TOKEN")
+        .args(&args)
+        .exec();
+    Err(anyhow::anyhow!("failed to launch claude: {err}"))
 }
 
 fn cmd_use(name: Option<String>, default: bool, pid: Option<u32>) -> Result<()> {
