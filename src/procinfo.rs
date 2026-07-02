@@ -4,7 +4,8 @@
 //!   - `pid_owning_local_port`: which process owns a loopback TCP source port
 //!     (used by the proxy to attribute an inbound connection to a claude PID).
 //!     On Linux this reads `/proc` directly (no external tools needed) and
-//!     falls back to `lsof`; elsewhere it uses `lsof`.
+//!     falls back to `lsof`; on Windows it parses `netstat -ano` with a
+//!     `Get-NetTCPConnection` fallback; elsewhere it uses `lsof`.
 //!   - `ancestors`: the PID chain up to the session, and `find_claude_ancestor`
 //!     (used by `ccc use` to discover the claude process that owns the shell it
 //!     was invoked from).
@@ -13,6 +14,7 @@ use std::collections::HashMap;
 
 /// Return the pid whose socket has `port` as its *local* port, excluding
 /// `exclude` (the daemon's own pid).
+#[cfg(not(windows))]
 pub fn pid_owning_local_port(port: u16, exclude: u32) -> Option<u32> {
     #[cfg(target_os = "linux")]
     if let Some(pid) = procfs_pid_owning_local_port(port, exclude) {
@@ -21,7 +23,14 @@ pub fn pid_owning_local_port(port: u16, exclude: u32) -> Option<u32> {
     lsof_pid_owning_local_port(port, exclude)
 }
 
+#[cfg(windows)]
+pub fn pid_owning_local_port(port: u16, exclude: u32) -> Option<u32> {
+    netstat_pid_owning_local_port(port, exclude)
+        .or_else(|| powershell_pid_owning_local_port(port, exclude))
+}
+
 /// `lsof`-based lookup, using machine-readable field output.
+#[cfg(not(windows))]
 fn lsof_pid_owning_local_port(port: u16, exclude: u32) -> Option<u32> {
     // `lsof -nP -iTCP:PORT` lists both endpoints of the loopback connection:
     // the client (claude) whose local port == PORT, and the daemon whose
@@ -44,6 +53,7 @@ fn lsof_pid_owning_local_port(port: u16, exclude: u32) -> Option<u32> {
 /// Pure parser for `lsof -Fpn` output: find the pid (≠ `exclude`) with a socket
 /// whose *local* port equals `port`. Separated out so it can be unit-tested
 /// without spawning lsof.
+#[cfg_attr(windows, allow(dead_code))]
 fn parse_owner_from_lsof(output: &str, port: u16, exclude: u32) -> Option<u32> {
     let mut cur_pid: Option<u32> = None;
     for line in output.lines() {
@@ -135,9 +145,70 @@ fn find_pid_by_socket_inode(inode: u64, exclude: u32) -> Option<u32> {
     None
 }
 
+/// Windows: `netstat -ano -p TCP` lists connections with owning PIDs.
+#[cfg(windows)]
+fn netstat_pid_owning_local_port(port: u16, exclude: u32) -> Option<u32> {
+    let out = std::process::Command::new("netstat")
+        .args(["-ano", "-p", "TCP"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    parse_owner_from_netstat(&text, port, exclude)
+}
+
+/// Windows fallback when netstat parsing yields nothing (e.g. a localized
+/// state column): structured lookup via PowerShell.
+#[cfg(windows)]
+fn powershell_pid_owning_local_port(port: u16, exclude: u32) -> Option<u32> {
+    let script = format!(
+        "(Get-NetTCPConnection -LocalPort {port} -State Established -ErrorAction SilentlyContinue | Select-Object -First 1).OwningProcess"
+    );
+    let out = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .output()
+        .ok()?;
+    let pid = String::from_utf8_lossy(&out.stdout).trim().parse().ok()?;
+    (pid != exclude && pid != 0).then_some(pid)
+}
+
+/// Pure parser for `netstat -ano` output: the pid (≠ `exclude`, ≠ 0) of the
+/// TCP connection whose *local* port equals `port`. Rows look like
+/// `  TCP    127.0.0.1:50123    127.0.0.1:8787    ESTABLISHED    1234`
+/// (also `[::1]:PORT` for v6). Prefers an ESTABLISHED row but accepts any
+/// live-pid match so localized state names still resolve; pid-0 rows
+/// (TIME_WAIT ghosts) never match.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn parse_owner_from_netstat(output: &str, port: u16, exclude: u32) -> Option<u32> {
+    let mut fallback: Option<u32> = None;
+    for line in output.lines() {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        // proto, local, foreign, state, pid — UDP rows have only 4 fields.
+        if f.len() != 5 || !f[0].starts_with("TCP") {
+            continue;
+        }
+        let local_port = f[1].rsplit(':').next().and_then(|p| p.parse::<u16>().ok());
+        if local_port != Some(port) {
+            continue;
+        }
+        let pid = match f[4].parse::<u32>() {
+            Ok(p) if p != 0 && p != exclude => p,
+            _ => continue,
+        };
+        if f[3] == "ESTABLISHED" {
+            return Some(pid);
+        }
+        fallback.get_or_insert(pid);
+    }
+    fallback
+}
+
 /// Map of pid -> (ppid, full command line) for all processes, via one `ps`
 /// call. The full command (not just `comm`) is needed to recognize npm/`node`
 /// and `bun` installs of Claude Code, where `comm` is `node`/`bun`.
+#[cfg(not(windows))]
 fn process_table() -> HashMap<u32, (u32, String)> {
     let mut map = HashMap::new();
     if let Ok(out) = std::process::Command::new("ps")
@@ -154,6 +225,57 @@ fn process_table() -> HashMap<u32, (u32, String)> {
                 }
             }
         }
+    }
+    map
+}
+
+/// Windows process table via one PowerShell CIM query (wmic is gone from
+/// current Windows 11). JSON output avoids CSV quoting pitfalls in
+/// CommandLine values.
+#[cfg(windows)]
+fn process_table() -> HashMap<u32, (u32, String)> {
+    let out = std::process::Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,CommandLine | ConvertTo-Json -Compress",
+        ])
+        .output();
+    match out {
+        Ok(o) if o.status.success() => {
+            parse_process_table_json(&String::from_utf8_lossy(&o.stdout))
+        }
+        _ => HashMap::new(),
+    }
+}
+
+/// Pure parser for the `Win32_Process | ConvertTo-Json` output.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn parse_process_table_json(text: &str) -> HashMap<u32, (u32, String)> {
+    let mut map = HashMap::new();
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(text.trim()) else {
+        return map;
+    };
+    // A single-process result serializes as an object, not a one-item array.
+    let items = match &v {
+        serde_json::Value::Array(a) => a.as_slice(),
+        serde_json::Value::Object(_) => std::slice::from_ref(&v),
+        _ => return map,
+    };
+    for p in items {
+        let (Some(pid), Some(ppid)) = (
+            p.get("ProcessId").and_then(|x| x.as_u64()),
+            p.get("ParentProcessId").and_then(|x| x.as_u64()),
+        ) else {
+            continue;
+        };
+        let command = p
+            .get("CommandLine")
+            .and_then(|x| x.as_str())
+            .unwrap_or_default()
+            .to_string();
+        map.insert(pid as u32, (ppid as u32, command));
     }
     map
 }
@@ -202,12 +324,28 @@ pub fn find_claude_ancestor(start: u32) -> Option<u32> {
 }
 
 /// Heuristic: does this full command line belong to the Claude Code CLI?
-/// Covers the native binary (`.../claude`), npm/`node` installs
-/// (`node .../@anthropic-ai/claude-code/cli.js`), and `bun` installs.
+/// Covers the native binary (`.../claude`, `claude.exe`), npm/`node` installs
+/// (`node .../@anthropic-ai/claude-code/cli.js`), and `bun` installs — with
+/// Windows path separators and quoted argv0 normalized first.
 fn is_claude_command(command: &str) -> bool {
-    // First whitespace-separated token is the executable (argv0).
-    let argv0 = command.split_whitespace().next().unwrap_or(command);
-    let exe = argv0.rsplit('/').next().unwrap_or(argv0);
+    // Normalize separators so one set of matchers covers Windows too.
+    let norm = command.replace('\\', "/");
+
+    // argv0 is the first whitespace-separated token, or the quoted prefix on
+    // Windows (`"C:\Program Files\...\claude.exe" --flag`).
+    let argv0 = match norm.strip_prefix('"') {
+        Some(rest) => rest.split('"').next().unwrap_or(""),
+        None => norm.split_whitespace().next().unwrap_or(&norm),
+    };
+    let exe = argv0
+        .rsplit('/')
+        .next()
+        .unwrap_or(argv0)
+        .to_ascii_lowercase();
+    let exe = exe
+        .strip_suffix(".exe")
+        .or_else(|| exe.strip_suffix(".cmd"))
+        .unwrap_or(&exe);
 
     // Native install: the executable itself is `claude`.
     if exe == "claude" {
@@ -218,10 +356,10 @@ fn is_claude_command(command: &str) -> bool {
     // we don't misfire on unrelated processes that merely mention the word.
     let runner = matches!(exe, "node" | "bun" | "node.js" | "deno");
     if runner
-        && (command.contains("@anthropic-ai/claude-code")
-            || command.contains("claude-code/cli")
-            || command.contains(".claude/local/")
-            || command.contains("/claude-code/"))
+        && (norm.contains("@anthropic-ai/claude-code")
+            || norm.contains("claude-code/cli")
+            || norm.contains(".claude/local/")
+            || norm.contains("/claude-code/"))
     {
         return true;
     }
@@ -230,7 +368,7 @@ fn is_claude_command(command: &str) -> bool {
 
 /// The full command line of a process, or empty if it can't be read. Used as
 /// a pid-reuse guard before killing a recorded daemon pid.
-#[cfg(target_os = "linux")]
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 pub fn command_of(pid: u32) -> String {
     process_table()
         .get(&pid)
@@ -239,12 +377,25 @@ pub fn command_of(pid: u32) -> String {
 }
 
 /// True if a process with this pid currently exists.
+#[cfg(not(windows))]
 pub fn pid_alive(pid: u32) -> bool {
     // signal 0 checks existence without delivering a signal.
     std::process::Command::new("kill")
         .args(["-0", &pid.to_string()])
         .output()
         .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// True if a process with this pid currently exists (Windows). `tasklist`
+/// prints a CSV row containing the quoted pid on a match, and a prose INFO
+/// line (in any locale, without the pid) when there is none.
+#[cfg(windows)]
+pub fn pid_alive(pid: u32) -> bool {
+    std::process::Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).contains(&format!("\"{pid}\"")))
         .unwrap_or(false)
 }
 
@@ -296,6 +447,74 @@ mod tests {
         assert_eq!(parse_inode_from_proc_net_tcp(text, 0x2257), None);
         // …and an unknown port finds nothing.
         assert_eq!(parse_inode_from_proc_net_tcp(text, 0x1234), None);
+    }
+
+    #[test]
+    fn netstat_finds_established_local_port() {
+        // Client 127.0.0.1:50123 -> daemon :8787 (pid 1234); the daemon's own
+        // accepted socket is the mirror row (pid 222); a TIME_WAIT ghost on
+        // the same local port has pid 0; UDP rows have no state column.
+        let out = "\
+Active Connections
+
+  Proto  Local Address          Foreign Address        State           PID
+  TCP    0.0.0.0:8787           0.0.0.0:0              LISTENING       222
+  TCP    127.0.0.1:50123        127.0.0.1:8787         TIME_WAIT       0
+  TCP    127.0.0.1:50123        127.0.0.1:8787         ESTABLISHED     1234
+  TCP    127.0.0.1:8787         127.0.0.1:50123        ESTABLISHED     222
+  UDP    0.0.0.0:5353           *:*                                    555
+";
+        assert_eq!(parse_owner_from_netstat(out, 50123, 222), Some(1234));
+        // The daemon pid is excluded even though its accepted socket's local
+        // port is the daemon port.
+        assert_eq!(parse_owner_from_netstat(out, 8787, 222), None);
+        assert_eq!(parse_owner_from_netstat(out, 40000, 222), None);
+    }
+
+    #[test]
+    fn netstat_localized_state_still_resolves() {
+        // Non-English Windows localizes the state column; a matching local
+        // port with a live pid should still resolve via the fallback.
+        let out = "  TCP    [::1]:50200            [::1]:8787             HERGESTELLT     4321\n";
+        assert_eq!(parse_owner_from_netstat(out, 50200, 222), Some(4321));
+    }
+
+    #[test]
+    fn parses_powershell_process_table_json() {
+        // Array form + null CommandLine (system processes).
+        let text = r#"[{"ProcessId":4,"ParentProcessId":0,"CommandLine":null},
+            {"ProcessId":1234,"ParentProcessId":4,"CommandLine":"\"C:\\Users\\x\\AppData\\Local\\Programs\\claude\\claude.exe\" --resume"}]"#;
+        let map = parse_process_table_json(text);
+        assert_eq!(map.get(&4).map(|(pp, _)| *pp), Some(0));
+        assert!(map.get(&1234).unwrap().1.contains("claude.exe"));
+
+        // Single process serializes as a bare object.
+        let one = r#"{"ProcessId":7,"ParentProcessId":1,"CommandLine":"ccc daemon run"}"#;
+        let map = parse_process_table_json(one);
+        assert_eq!(map.get(&7).map(|(pp, _)| *pp), Some(1));
+
+        assert!(parse_process_table_json("not json").is_empty());
+    }
+
+    #[test]
+    fn detects_windows_installs() {
+        // Native install, quoted path with spaces.
+        assert!(is_claude_command(
+            r#""C:\Users\x\AppData\Local\Programs\claude\claude.exe" --resume"#
+        ));
+        // Unquoted native path.
+        assert!(is_claude_command(r"C:\tools\claude.exe"));
+        // npm shim under node.exe.
+        assert!(is_claude_command(
+            r#""C:\Program Files\nodejs\node.exe" "C:\Users\x\AppData\Roaming\npm\node_modules\@anthropic-ai\claude-code\cli.js""#
+        ));
+        // Unrelated Windows processes don't match.
+        assert!(!is_claude_command(
+            r"C:\Windows\System32\svchost.exe -k netsvcs"
+        ));
+        assert!(!is_claude_command(
+            r#""C:\Program Files\nodejs\node.exe" C:\app\server.js"#
+        ));
     }
 
     #[test]
