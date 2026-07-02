@@ -112,7 +112,7 @@ enum DaemonAction {
         #[arg(long, default_value_t = daemon::DEFAULT_PORT)]
         port: u16,
     },
-    /// Install + start the autostart agent (launchd on macOS, systemd on Linux).
+    /// Install + start the autostart agent (launchd / systemd / Run key).
     Start {
         #[arg(long, default_value_t = daemon::DEFAULT_PORT)]
         port: u16,
@@ -442,9 +442,22 @@ async fn cmd_run(name: &str, args: Vec<String>) -> Result<()> {
     }
     #[cfg(not(unix))]
     {
-        let status = cmd
-            .status()
-            .map_err(|e| anyhow::anyhow!("failed to launch claude: {e}"))?;
+        let status = match cmd.status() {
+            Ok(s) => s,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // npm installs ship a `claude.cmd` shim, which CreateProcess
+                // won't resolve for a bare `claude` — route through cmd.exe.
+                let mut shim = std::process::Command::new("cmd");
+                shim.args(["/C", "claude"])
+                    .env("CLAUDE_CONFIG_DIR", &home)
+                    .env("ANTHROPIC_BASE_URL", &base)
+                    .env_remove("ANTHROPIC_AUTH_TOKEN")
+                    .args(&args);
+                shim.status()
+                    .map_err(|e| anyhow::anyhow!("failed to launch claude: {e}"))?
+            }
+            Err(e) => return Err(anyhow::anyhow!("failed to launch claude: {e}")),
+        };
         std::process::exit(status.code().unwrap_or(1));
     }
 }
@@ -616,6 +629,35 @@ async fn cmd_doctor() -> Result<()> {
         } else {
             ok = false;
             println!("✗ neither /proc/net/tcp nor lsof available — per-thread routing won't work");
+        }
+    }
+
+    // Per-thread routing prerequisites (Windows: netstat / PowerShell).
+    #[cfg(windows)]
+    {
+        let has_netstat = std::process::Command::new("netstat")
+            .args(["-p", "TCP", "-n"])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        let has_powershell = std::process::Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "$PSVersionTable.PSVersion.Major",
+            ])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if has_netstat || has_powershell {
+            println!(
+                "✓ per-thread routing via {}",
+                if has_netstat { "netstat" } else { "PowerShell" }
+            );
+        } else {
+            ok = false;
+            println!("✗ neither netstat nor PowerShell available — per-thread routing won't work");
         }
     }
 

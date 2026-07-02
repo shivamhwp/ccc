@@ -291,10 +291,112 @@ mod imp {
 }
 
 // ---------------------------------------------------------------------------
-// Other platforms (Windows): no autostart backend
+// Windows: HKCU Run key + hidden wscript launcher (no admin required)
 // ---------------------------------------------------------------------------
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(windows)]
+mod imp {
+    use super::*;
+    use anyhow::{anyhow, Context};
+
+    const RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
+    const RUN_VALUE: &str = "ccc";
+
+    fn launcher_path() -> Result<std::path::PathBuf> {
+        Ok(paths::ccc_dir()?.join("ccc-daemon.vbs"))
+    }
+
+    /// Register a Run-key entry that launches the daemon hidden at login, and
+    /// start it now. The launcher invokes `ccc daemon start`, which is
+    /// idempotent and redirects the daemon's output to ~/.ccc log files —
+    /// wscript's window style 0 keeps the console from ever appearing.
+    pub fn install_autostart(port: u16) -> Result<String> {
+        // No canonicalize() here: on Windows it yields a \\?\-prefixed path
+        // that wscript and the shell handle badly.
+        let exe = std::env::current_exe()?;
+        paths::ensure_ccc_dir()?;
+
+        let vbs_path = launcher_path()?;
+        std::fs::write(&vbs_path, super::windows_launcher_vbs(&exe, port))?;
+
+        let launcher = format!("wscript.exe \"{}\"", vbs_path.display());
+        let out = std::process::Command::new("reg")
+            .args([
+                "add", RUN_KEY, "/v", RUN_VALUE, "/t", "REG_SZ", "/d", &launcher, "/f",
+            ])
+            .output()
+            .context("reg add (Run key)")?;
+        if !out.status.success() {
+            return Err(anyhow!(
+                "registering the Run key failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+
+        let started = start_daemon_now(&exe, port)?;
+        Ok(format!("Run key `{RUN_VALUE}` + {started}"))
+    }
+
+    /// Spawn the daemon hidden and detached with output redirected to the
+    /// ~/.ccc log files. No-op if it's already running.
+    fn start_daemon_now(exe: &std::path::Path, port: u16) -> Result<String> {
+        if is_running() {
+            let rt = read_runtime().unwrap();
+            return Ok(format!("daemon already running (pid {})", rt.pid));
+        }
+        let log_dir = paths::ensure_ccc_dir()?;
+        let open_log = |name: &str| -> Result<std::fs::File> {
+            Ok(std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(log_dir.join(name))?)
+        };
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        let child = std::process::Command::new(exe)
+            .args(["daemon", "run", "--port", &port.to_string()])
+            .stdin(std::process::Stdio::null())
+            .stdout(open_log("daemon.out.log")?)
+            .stderr(open_log("daemon.err.log")?)
+            .creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP)
+            .spawn()
+            .context("spawning daemon")?;
+        Ok(format!("daemon started (pid {})", child.id()))
+    }
+
+    pub fn uninstall_autostart() -> Result<()> {
+        // Remove the Run key + launcher (ignore errors: may never have been
+        // installed).
+        let _ = std::process::Command::new("reg")
+            .args(["delete", RUN_KEY, "/v", RUN_VALUE, "/f"])
+            .output();
+        if let Ok(vbs) = launcher_path() {
+            let _ = std::fs::remove_file(vbs);
+        }
+
+        // Kill the recorded daemon if it's alive — guarded by a command-line
+        // check so a reused pid is never killed.
+        if let Some(rt) = read_runtime() {
+            if procinfo::pid_alive(rt.pid)
+                && procinfo::command_of(rt.pid)
+                    .to_ascii_lowercase()
+                    .contains("ccc")
+            {
+                let _ = std::process::Command::new("taskkill")
+                    .args(["/PID", &rt.pid.to_string(), "/T", "/F"])
+                    .output();
+            }
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Other platforms: no autostart backend
+// ---------------------------------------------------------------------------
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
 mod imp {
     use super::*;
     use anyhow::anyhow;
@@ -337,10 +439,34 @@ WantedBy=default.target
     )
 }
 
+/// The VBScript login launcher for Windows. Runs `ccc daemon start` with
+/// window style 0 (fully hidden) and no wait; `daemon start` is idempotent —
+/// it re-registers the Run key and spawns the daemon only if it isn't already
+/// running, with output redirected to the ~/.ccc log files. Pure function
+/// (and outside the cfg'd module) so it's unit-testable on every platform.
+#[allow(dead_code)]
+fn windows_launcher_vbs(exe: &std::path::Path, port: u16) -> String {
+    // VBScript string literals escape an embedded quote by doubling it, hence
+    // the `""…""` around the exe path (which may contain spaces).
+    format!(
+        "CreateObject(\"WScript.Shell\").Run \"\"\"{exe}\"\" daemon start --port {port}\", 0, False\r\n",
+        exe = exe.display(),
+        port = port,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::path::Path;
+
+    #[test]
+    fn windows_launcher_hides_window_and_quotes_path() {
+        let vbs = windows_launcher_vbs(Path::new(r"C:\Users\x y\AppData\Local\ccc\ccc.exe"), 8787);
+        assert!(vbs
+            .contains(r#""""C:\Users\x y\AppData\Local\ccc\ccc.exe"" daemon start --port 8787""#));
+        assert!(vbs.trim_end().ends_with(", 0, False"));
+    }
 
     #[test]
     fn systemd_unit_contains_exec_and_logs() {
