@@ -39,6 +39,12 @@ enum Command {
     Login {
         /// Profile name to store the account under.
         name: String,
+        /// Print the authorization URL and exit (step 1 of a two-step login).
+        #[arg(long)]
+        begin: bool,
+        /// Complete login with the pasted code (step 2). Implies the name used with --begin.
+        #[arg(long, value_name = "CODE")]
+        finish: Option<String>,
     },
     /// Import the account currently logged into Claude Code as a profile.
     Import {
@@ -119,7 +125,11 @@ async fn run() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Setup => cmd_setup().await,
-        Command::Login { name } => cmd_login(&name).await,
+        Command::Login {
+            name,
+            begin,
+            finish,
+        } => cmd_login(&name, begin, finish).await,
         Command::Import { name } => cmd_import(&name),
         Command::List => cmd_list(),
         Command::Whoami => cmd_whoami(),
@@ -193,10 +203,23 @@ async fn cmd_setup() -> Result<()> {
     Ok(())
 }
 
-async fn cmd_login(name: &str) -> Result<()> {
+fn login_pending_file() -> Result<std::path::PathBuf> {
+    Ok(paths::ccc_dir()?.join("login-pending.json"))
+}
+
+async fn cmd_login(name: &str, begin: bool, finish: Option<String>) -> Result<()> {
+    // Two-step (non-interactive) mode: --begin prints the URL, --finish <code>
+    // completes. Used for SSH/headless and for driving login programmatically.
+    if let Some(code) = finish {
+        return login_finish(name, &code).await;
+    }
+    if begin {
+        return login_begin(name);
+    }
+
+    // Interactive mode: print URL, open browser, read the pasted code.
     let pkce = oauth::new_pkce();
     let url = oauth::authorize_url(&pkce);
-
     println!("Opening your browser to sign in to Claude…");
     println!("If it doesn't open, visit:\n\n  {url}\n");
     let _ = std::process::Command::new("open").arg(&url).spawn();
@@ -212,11 +235,58 @@ async fn cmd_login(name: &str) -> Result<()> {
     if pasted.is_empty() {
         anyhow::bail!("no code entered");
     }
+    let profile = oauth::exchange_code(&pkce, pasted).await?;
+    save_login(name, profile)
+}
 
-    let mut profile = oauth::exchange_code(&pkce, pasted).await?;
+fn login_begin(name: &str) -> Result<()> {
+    paths::ensure_ccc_dir()?;
+    let pkce = oauth::new_pkce();
+    let url = oauth::authorize_url(&pkce);
+    let pending = serde_json::json!({
+        "name": name,
+        "verifier": pkce.verifier,
+        "state": pkce.state,
+    });
+    let path = login_pending_file()?;
+    std::fs::write(&path, serde_json::to_vec_pretty(&pending)?)?;
+    paths::set_mode(&path, 0o600)?;
 
-    // Enrich identity from ~/.claude.json if the token response lacked it and
-    // this looks like the same account.
+    println!("Open this URL, sign in, and copy the code shown afterwards:\n");
+    println!("  {url}\n");
+    println!("Then run:  ccc login {name} --finish '<paste code>'");
+    Ok(())
+}
+
+async fn login_finish(name: &str, code: &str) -> Result<()> {
+    let path = login_pending_file()?;
+    let bytes = std::fs::read(&path)
+        .context("no pending login found — run `ccc login <name> --begin` first")?;
+    let pending: serde_json::Value = serde_json::from_slice(&bytes)?;
+    let pending_name = pending.get("name").and_then(|v| v.as_str()).unwrap_or("");
+    if pending_name != name {
+        anyhow::bail!("pending login is for `{pending_name}`, not `{name}`");
+    }
+    let pkce = oauth::Pkce {
+        verifier: pending
+            .get("verifier")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        challenge: String::new(),
+        state: pending
+            .get("state")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string(),
+    };
+    let profile = oauth::exchange_code(&pkce, code).await?;
+    let _ = std::fs::remove_file(&path);
+    save_login(name, profile)
+}
+
+fn save_login(name: &str, mut profile: store::Profile) -> Result<()> {
+    // Enrich identity from ~/.claude.json if the token response lacked it.
     if profile.email.is_none() {
         if let Some(id) = store::read_claude_identity() {
             profile.email = id
@@ -229,7 +299,6 @@ async fn cmd_login(name: &str) -> Result<()> {
                 .map(str::to_string);
         }
     }
-
     let name_owned = name.to_string();
     let is_first = Store::update(move |s| {
         let first = s.profiles.is_empty();
@@ -239,7 +308,6 @@ async fn cmd_login(name: &str) -> Result<()> {
         }
         Ok(first)
     })?;
-
     println!(
         "✓ saved account `{name}`{}",
         if is_first { " (set as default)" } else { "" }
