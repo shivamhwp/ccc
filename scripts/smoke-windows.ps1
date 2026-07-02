@@ -31,10 +31,10 @@ function Wait-Health($port) {
     Fail "daemon on :$port never became healthy"
 }
 
-Say "seeding throwaway store (fake token, far-future expiry)"
+Say "seeding throwaway store (fake tokens, far-future expiry; two accounts)"
 New-Item -ItemType Directory -Force -Path $cccDir | Out-Null
 @'
-{"version":1,"default_profile":"smoke","profiles":{"smoke":{"access_token":"sk-ant-oat01-SMOKE-FAKE","refresh_token":"","expires_at":4102444800000,"scopes":[],"subscription_type":"max"}}}
+{"version":1,"default_profile":"smoke","profiles":{"smoke":{"access_token":"sk-ant-oat01-SMOKE-FAKE","refresh_token":"","expires_at":4102444800000,"scopes":[],"subscription_type":"max"},"other":{"access_token":"sk-ant-oat01-OTHER-FAKE","refresh_token":"","expires_at":4102444800000,"scopes":[],"subscription_type":"pro"}}}
 '@ | Set-Content -Path (Join-Path $cccDir "store.json") -Encoding UTF8
 
 # --- 1. routing: PID attribution through the proxy -------------------------
@@ -53,11 +53,38 @@ Say "sending a request through the proxy"
 Start-Sleep -Milliseconds 500
 
 $log = Get-Content $logErr -Raw -ErrorAction SilentlyContinue
-if ($log -notmatch '\[ccc\] .* pid=(\d+) profile=smoke') {
+if ($log -notmatch '\[ccc\] .* pid=(\d+) profile=smoke \[passthru\]') {
     Write-Host $log
     Fail "proxy log has no per-request pid attribution (netstat lookup failed?)"
 }
 Say "pid attribution ok: request attributed to pid $($Matches[1])"
+
+# --- 1b. per-thread switching: `ccc use` + ancestor walk --------------------
+# Route THIS PowerShell pid to `other`, then request from a CHILD process:
+# resolution must miss the direct route entry for curl's pid and walk the
+# ancestor chain (PowerShell CIM process table) up to the routed pid.
+Say "routing this shell (pid $PID) to 'other'; requesting from a child"
+& $ccc use other --pid $PID
+if ($LASTEXITCODE -ne 0) { Fail "ccc use other --pid failed" }
+& curl.exe -s -o NUL --max-time 30 "http://127.0.0.1:8788/v1/models"
+Start-Sleep -Milliseconds 500
+$log = Get-Content $logErr -Raw -ErrorAction SilentlyContinue
+if ($log -notmatch 'profile=other \[override\]') {
+    Write-Host $log
+    Fail "routed request was not attributed to 'other' (ancestor walk via CIM failed?)"
+}
+Say "per-thread switch ok: child request billed to 'other' [override]"
+
+Say "reverting to default; requesting again"
+& $ccc use --default --pid $PID
+& curl.exe -s -o NUL --max-time 30 "http://127.0.0.1:8788/v1/models"
+Start-Sleep -Milliseconds 500
+$tail = (Get-Content $logErr | Select-String '\[ccc\]' | Select-Object -Last 1).ToString()
+if ($tail -notmatch 'profile=smoke \[passthru\]') {
+    Write-Host $tail
+    Fail "revert to default did not take effect (last: $tail)"
+}
+Say "revert ok: back to 'smoke' [passthru]"
 
 Stop-Process -Id $daemon.Id -Force
 Stop-Process -Id $upstream.Id -Force
@@ -96,4 +123,4 @@ if (Get-Process -Id $daemonPid -ErrorAction SilentlyContinue) { Fail "daemon pid
 $statusAfter = & $ccc daemon status | Out-String
 if ($statusAfter -notmatch "not running") { Fail "daemon status after stop says: $statusAfter" }
 
-Write-Host "`nPASS: routing attribution + autostart lifecycle verified" -ForegroundColor Green
+Write-Host "`nPASS: routing attribution + per-thread switching + autostart lifecycle verified" -ForegroundColor Green
