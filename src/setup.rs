@@ -39,15 +39,16 @@ pub fn patch_settings(base_url: &str) -> Result<String> {
         "ANTHROPIC_BASE_URL".to_string(),
         serde_json::json!(base_url),
     );
-    // Claude Code has a local auth gate: it will not send any request unless it
-    // believes it is authenticated. A placeholder auth token satisfies that gate
-    // so every thread reaches the proxy; the proxy always overwrites the
-    // Authorization header with the routed account's real subscription token, so
-    // this value is never used for anything.
-    env_obj.insert(
-        "ANTHROPIC_AUTH_TOKEN".to_string(),
-        serde_json::json!("ccc-managed-by-proxy"),
-    );
+    // We deliberately do NOT set ANTHROPIC_AUTH_TOKEN. Claude Code's real
+    // claude.ai login (in the config dir / Keychain) satisfies the auth gate and
+    // drives the account/subscription shown in `/status` — so it reads as a
+    // subscription, not "API key". The proxy still swaps the actual per-request
+    // token for non-default / pinned routes. Clean up any placeholder a previous
+    // ccc version wrote.
+    if env_obj.get("ANTHROPIC_AUTH_TOKEN").and_then(|v| v.as_str()) == Some("ccc-managed-by-proxy")
+    {
+        env_obj.remove("ANTHROPIC_AUTH_TOKEN");
+    }
 
     // Back up the previous file once per run before overwriting.
     if path.exists() {

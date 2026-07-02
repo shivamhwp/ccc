@@ -111,13 +111,24 @@ async fn proxy_inner(
     // where each provider instance sets its own base URL). It takes precedence
     // over PID-based routing. Otherwise fall back to PID → default.
     let (pin, fwd_path) = extract_account_pin(uri.path());
+    let store = Store::load()?;
     let (profile_name, matched_pid) = match pin {
-        Some(ref name) if Store::load()?.profiles.contains_key(name) => (name.clone(), None),
+        Some(ref name) if store.profiles.contains_key(name) => (name.clone(), None),
         _ => resolve_profile(peer.port(), state.self_pid)?,
     };
+
+    // Token-ownership rule: ccc overrides the auth header only when the request
+    // is explicitly pinned (t3code) or routed to a non-default account
+    // (`ccc use <other>`). For the default account on an unpinned request, the
+    // caller is using its own real Claude login — pass it through untouched so
+    // Claude Code keeps managing that login (accurate `/status`, no refresh
+    // conflict, no need for a placeholder token).
+    let is_default = store.default_profile.as_deref() == Some(profile_name.as_str());
+    let override_auth = pin.is_some() || !is_default;
+
     if state.log {
         eprintln!(
-            "[ccc] {} {} pid={} profile={}{}",
+            "[ccc] {} {} pid={} profile={}{} {}",
             method,
             uri.path(),
             matched_pid
@@ -125,13 +136,15 @@ async fn proxy_inner(
                 .unwrap_or_else(|| "?".into()),
             profile_name,
             if pin.is_some() { " (pinned)" } else { "" },
+            if override_auth {
+                "[override]"
+            } else {
+                "[passthru]"
+            },
         );
     }
 
-    // 3: ensure a fresh token for that profile.
-    let token = ensure_fresh_token(&state, &profile_name).await?;
-
-    // 4: build upstream request (with any `/a/<account>` prefix stripped).
+    // Build upstream request (with any `/a/<account>` prefix stripped).
     let path_and_query = match uri.query() {
         Some(q) => format!("{fwd_path}?{q}"),
         None => fwd_path,
@@ -146,12 +159,17 @@ async fn proxy_inner(
         fwd.insert(name.clone(), value.clone());
     }
     fwd.remove(axum::http::header::HOST);
-    fwd.remove("x-api-key");
-    fwd.insert(
-        axum::http::header::AUTHORIZATION,
-        HeaderValue::from_str(&format!("Bearer {token}"))?,
-    );
-    inject_beta(&mut fwd)?;
+
+    if override_auth {
+        let token = ensure_fresh_token(&state, &profile_name).await?;
+        fwd.remove("x-api-key");
+        fwd.insert(
+            axum::http::header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {token}"))?,
+        );
+        inject_beta(&mut fwd)?;
+    }
+    // else: pass the caller's own Authorization header through unchanged.
 
     let body_stream = body.into_data_stream();
     let reqwest_body = reqwest::Body::wrap_stream(body_stream);
@@ -225,6 +243,19 @@ fn resolve_profile(peer_port: u16, self_pid: u32) -> Result<(String, Option<u32>
 async fn ensure_fresh_token(state: &AppState, profile: &str) -> Result<String> {
     {
         let store = Store::load()?;
+        // The default account is owned by Claude Code (Keychain / credentials
+        // file), which keeps it fresh. Read the live token from there rather
+        // than refreshing a separate copy — refreshing would rotate the token
+        // out from under the user's normal Claude login. ccc only actively
+        // refreshes non-default accounts (its own store).
+        if store.default_profile.as_deref() == Some(profile) {
+            if let Ok(v) = crate::store::read_keychain_login() {
+                if let Some(tok) = v.get("accessToken").and_then(|t| t.as_str()) {
+                    return Ok(tok.to_string());
+                }
+            }
+            // Fall through to the stored copy if the Keychain read fails.
+        }
         let p = store
             .profiles
             .get(profile)
