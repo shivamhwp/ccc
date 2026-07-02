@@ -2,8 +2,6 @@
 import "@fontsource/micro-5";
 import "@fontsource-variable/geist-mono";
 
-const INSTALL = "curl -fsSL https://raw.githubusercontent.com/shivamhwp/ccc/main/scripts/install.sh | bash";
-
 const commands: [string, string][] = [
   ["ccc setup", "Wire up Claude Code: import your login, start the daemon, install the skill."],
   ["ccc login <name>", "Add another account via browser sign-in, saved under <name>."],
@@ -18,6 +16,15 @@ const commands: [string, string][] = [
   ["ccc daemon start | stop | status", "Control the local proxy daemon."],
   ["ccc teardown", "Undo ccc setup."],
 ];
+
+// Plain-text version of the page that the "copy page" button copies.
+const pageText = [
+  "ccc — use two or more claude accounts on your device",
+  "",
+  ...commands.map(([cmd, desc]) => `${cmd} — ${desc}`),
+  "",
+  "https://github.com/shivamhwp/ccc",
+].join("\n");
 ---
 
 <!doctype html>
@@ -36,7 +43,10 @@ const commands: [string, string][] = [
     <div class="wrap">
       <header class="top">
         <h1 class="logo">ccc</h1>
-        <button class="copy" data-cmd={INSTALL} aria-label="Copy install command">copy</button>
+        <div class="actions">
+          <button class="copy" data-copy={pageText} aria-label="Copy page">copy page</button>
+          <a class="gh" href="https://github.com/shivamhwp/ccc" target="_blank" rel="noopener noreferrer">gh</a>
+        </div>
       </header>
 
       <dl class="commands">
@@ -85,6 +95,7 @@ const commands: [string, string][] = [
         letter-spacing: 0.02em;
       }
 
+      .actions { display: flex; align-items: center; gap: 1rem; }
       .copy {
         font-family: inherit;
         font-size: 0.8rem;
@@ -97,6 +108,14 @@ const commands: [string, string][] = [
         transition: background 0.15s ease, color 0.15s ease;
       }
       .copy:hover, .copy.copied { background: var(--fg); color: var(--bg); }
+      .gh {
+        font-family: inherit;
+        font-size: 0.8rem;
+        color: var(--fg);
+        text-decoration: none;
+        border-bottom: 1px solid transparent;
+      }
+      .gh:hover { border-bottom-color: var(--fg); }
 
       .commands { display: flex; flex-direction: column; }
       .row {
@@ -120,9 +139,9 @@ const commands: [string, string][] = [
     <script>
       const btn = document.querySelector(".copy");
       btn?.addEventListener("click", async () => {
-        const cmd = btn.getAttribute("data-cmd") ?? "";
+        const text = btn.getAttribute("data-copy") ?? "";
         try {
-          await navigator.clipboard.writeText(cmd);
+          await navigator.clipboard.writeText(text);
           const prev = btn.textContent;
           btn.textContent = "copied";
           btn.classList.add("copied");
