@@ -307,17 +307,16 @@ mod imp {
     }
 
     /// Register a Run-key entry that launches the daemon hidden at login, and
-    /// start it now. The launcher invokes `ccc daemon start`, which is
-    /// idempotent and redirects the daemon's output to ~/.ccc log files —
-    /// wscript's window style 0 keeps the console from ever appearing.
+    /// start it now. Both paths go through the same wscript launcher, whose
+    /// window style 0 keeps a console from ever appearing.
     pub fn install_autostart(port: u16) -> Result<String> {
         // No canonicalize() here: on Windows it yields a \\?\-prefixed path
         // that wscript and the shell handle badly.
         let exe = std::env::current_exe()?;
-        paths::ensure_ccc_dir()?;
+        let log_dir = paths::ensure_ccc_dir()?;
 
         let vbs_path = launcher_path()?;
-        std::fs::write(&vbs_path, super::windows_launcher_vbs(&exe, port))?;
+        std::fs::write(&vbs_path, super::windows_launcher_vbs(&exe, port, &log_dir))?;
 
         let launcher = format!("wscript.exe \"{}\"", vbs_path.display());
         let out = std::process::Command::new("reg")
@@ -333,36 +332,44 @@ mod imp {
             ));
         }
 
-        let started = start_daemon_now(&exe, port)?;
+        let started = start_daemon_now(&vbs_path)?;
         Ok(format!("Run key `{RUN_VALUE}` + {started}"))
     }
 
-    /// Spawn the daemon hidden and detached with output redirected to the
-    /// ~/.ccc log files. No-op if it's already running.
-    fn start_daemon_now(exe: &std::path::Path, port: u16) -> Result<String> {
+    /// Start the daemon now (hidden) via the wscript launcher. No-op if it's
+    /// already running.
+    ///
+    /// The indirection is deliberate, not just window hiding: spawning the
+    /// daemon directly from this process would hand it our inheritable stdio
+    /// pipe handles (`bInheritHandles` is set whenever stdio is redirected),
+    /// so a caller consuming our output — `ccc setup | tee`, a CI step, an
+    /// agent's shell tool — would never see EOF and hang until the daemon
+    /// exits. `WScript.Shell.Run` creates the process via ShellExecute, which
+    /// passes no handles; wscript itself exits within milliseconds.
+    fn start_daemon_now(vbs: &std::path::Path) -> Result<String> {
         if is_running() {
             let rt = read_runtime().unwrap();
             return Ok(format!("daemon already running (pid {})", rt.pid));
         }
-        let log_dir = paths::ensure_ccc_dir()?;
-        let open_log = |name: &str| -> Result<std::fs::File> {
-            Ok(std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(log_dir.join(name))?)
-        };
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-        let child = std::process::Command::new(exe)
-            .args(["daemon", "run", "--port", &port.to_string()])
+        std::process::Command::new("wscript.exe")
+            .arg("//B")
+            .arg(vbs)
             .stdin(std::process::Stdio::null())
-            .stdout(open_log("daemon.out.log")?)
-            .stderr(open_log("daemon.err.log")?)
-            .creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
             .spawn()
-            .context("spawning daemon")?;
-        Ok(format!("daemon started (pid {})", child.id()))
+            .context("launching daemon via wscript")?;
+
+        // The daemon writes daemon.json as it comes up; wait briefly so we can
+        // report the pid instead of guessing.
+        for _ in 0..25 {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            if is_running() {
+                let rt = read_runtime().unwrap();
+                return Ok(format!("daemon started (pid {})", rt.pid));
+            }
+        }
+        Ok("daemon starting in the background (check `ccc daemon status`)".into())
     }
 
     pub fn uninstall_autostart() -> Result<()> {
@@ -439,20 +446,25 @@ WantedBy=default.target
     )
 }
 
-/// The VBScript login launcher for Windows. Runs `ccc daemon start` with
-/// window style 0 (fully hidden) and no wait; `daemon start` is idempotent —
-/// it re-registers the Run key and spawns the daemon only if it isn't already
-/// running, with output redirected to the ~/.ccc log files. Pure function
-/// (and outside the cfg'd module) so it's unit-testable on every platform.
+/// The VBScript daemon launcher for Windows, used both by the Run key at
+/// login and by `ccc daemon start`. Runs the daemon under a hidden `cmd /c`
+/// (window style 0, no wait) with stdout/stderr appended to the ~/.ccc log
+/// files — matching what launchd/systemd do on the other platforms. Pure
+/// function (and outside the cfg'd module) so it's unit-testable everywhere.
 #[allow(dead_code)]
-fn windows_launcher_vbs(exe: &std::path::Path, port: u16) -> String {
-    // VBScript string literals escape an embedded quote by doubling it, hence
-    // the `""…""` around the exe path (which may contain spaces).
-    format!(
-        "CreateObject(\"WScript.Shell\").Run \"\"\"{exe}\"\" daemon start --port {port}\", 0, False\r\n",
+fn windows_launcher_vbs(exe: &std::path::Path, port: u16, log_dir: &std::path::Path) -> String {
+    // The command line WScript.Shell.Run receives. `cmd /c ""app" args"`
+    // (outer quotes around the whole command) is cmd's canonical quoting for
+    // a quoted program path plus arguments.
+    let cmdline = format!(
+        r#"cmd /c ""{exe}" daemon run --port {port} >> "{log}\daemon.out.log" 2>>"{log}\daemon.err.log""#,
         exe = exe.display(),
         port = port,
-    )
+        log = log_dir.display(),
+    ) + "\"";
+    // VBScript string literals escape an embedded quote by doubling it.
+    let escaped = cmdline.replace('"', "\"\"");
+    format!("CreateObject(\"WScript.Shell\").Run \"{escaped}\", 0, False\r\n")
 }
 
 #[cfg(test)]
@@ -462,9 +474,20 @@ mod tests {
 
     #[test]
     fn windows_launcher_hides_window_and_quotes_path() {
-        let vbs = windows_launcher_vbs(Path::new(r"C:\Users\x y\AppData\Local\ccc\ccc.exe"), 8787);
-        assert!(vbs
-            .contains(r#""""C:\Users\x y\AppData\Local\ccc\ccc.exe"" daemon start --port 8787""#));
+        let vbs = windows_launcher_vbs(
+            Path::new(r"C:\Users\x y\AppData\Local\ccc\ccc.exe"),
+            8787,
+            Path::new(r"C:\Users\x y\.ccc"),
+        );
+        // Every quote in the cmd line is doubled for the VBS string literal.
+        assert!(vbs.starts_with(r#"CreateObject("WScript.Shell").Run "cmd /c """#));
+        assert!(
+            vbs.contains(r#"""C:\Users\x y\AppData\Local\ccc\ccc.exe"" daemon run --port 8787"#)
+        );
+        assert!(vbs.contains(
+            r#">> ""C:\Users\x y\.ccc\daemon.out.log"" 2>>""C:\Users\x y\.ccc\daemon.err.log"#
+        ));
+        // Window style 0 (hidden), no wait.
         assert!(vbs.trim_end().ends_with(", 0, False"));
     }
 
