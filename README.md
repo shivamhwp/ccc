@@ -20,7 +20,7 @@
 `ccc` keeps several Claude subscription accounts on one machine and switches which one a Claude Code thread uses — **per thread, live, no restarts**. Two threads can run two different accounts at the same time. Subscription auth only; no API keys are ever stored or used.
 
 > [!NOTE]
-> `ccc` is early software. macOS is fully supported today; Linux works with manual daemon start; Windows is experimental. See [Platform support](#platform-support).
+> `ccc` is early software. macOS and Linux are fully supported today; Windows is experimental. See [Platform support](#platform-support).
 
 ## Install
 
@@ -98,19 +98,21 @@ Because selection happens per request, `ccc use <name>` changes the account for 
 | Platform | Binary | Per-thread routing | Autostart |
 |---|:---:|:---:|:---:|
 | macOS (arm64 / x64) | ✅ | ✅ | ✅ launchd |
-| Linux (x64) | ✅ | ✅ | ⏳ systemd planned — run `ccc daemon run` |
+| Linux (x64) | ✅ | ✅ via `/proc` (no lsof needed) | ✅ systemd user unit* |
 | Windows (x64) | ✅ | 🧪 experimental | 🧪 experimental |
+
+\* On Linux hosts without a user systemd session (some WSL/container setups), `ccc daemon start` falls back to a detached background process — it runs immediately but won't restart after reboot.
 
 ## Testing
 
 ```sh
-cargo test           # unit: lsof parsing, PKCE, store/refresh, routing
+cargo test           # unit: lsof + /proc/net/tcp parsing, PKCE, store/refresh, routing
 ./scripts/smoke.sh   # end-to-end: proves auth + per-thread routing, then cleans up
 ```
 
 ## Files & configuration
 
-State lives in `~/.ccc/`: `store.json` (accounts + subscription tokens, `0600`), `routes.json` (live PID → account), `daemon.json` (pid + port).
+State lives in `~/.ccc/`: `store.json` (accounts + subscription tokens, `0600`), `routes.json` (live PID → account), `daemon.json` (pid + port). The autostart agent lives at `~/Library/LaunchAgents/ing.shivam.ccc.plist` (macOS) or `~/.config/systemd/user/ccc.service` (Linux).
 
 OAuth endpoints and the upstream base are overridable via `CCC_OAUTH_*` and `CCC_UPSTREAM_BASE` env vars (useful if a Claude Code update moves an endpoint). Set `CCC_LOG=1` on the daemon for a per-request routing log.
 

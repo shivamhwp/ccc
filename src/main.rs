@@ -107,17 +107,17 @@ enum T3Action {
 
 #[derive(Subcommand)]
 enum DaemonAction {
-    /// Run the proxy in the foreground (used by launchd).
+    /// Run the proxy in the foreground (used by launchd/systemd).
     Run {
         #[arg(long, default_value_t = daemon::DEFAULT_PORT)]
         port: u16,
     },
-    /// Install + start the launchd agent.
+    /// Install + start the autostart agent (launchd on macOS, systemd on Linux).
     Start {
         #[arg(long, default_value_t = daemon::DEFAULT_PORT)]
         port: u16,
     },
-    /// Stop and remove the launchd agent.
+    /// Stop the daemon and remove the autostart agent.
     Stop,
     /// Show daemon status.
     Status,
@@ -195,10 +195,10 @@ async fn cmd_setup() -> Result<()> {
         }
     }
 
-    // 2. Start the daemon (launchd).
+    // 2. Start the daemon (launchd / systemd / detached fallback).
     let port = daemon::DEFAULT_PORT;
-    match daemon::install_launchd(port) {
-        Ok(p) => println!("✓ daemon installed at {}", p.display()),
+    match daemon::install_autostart(port) {
+        Ok(desc) => println!("✓ daemon started — {desc}"),
         Err(e) => eprintln!("note: daemon autostart not installed ({e:#}). Use `ccc daemon run`."),
     }
 
@@ -233,7 +233,7 @@ async fn cmd_login(name: &str, begin: bool, finish: Option<String>) -> Result<()
     let url = oauth::authorize_url(&pkce);
     println!("Opening your browser to sign in to Claude…");
     println!("If it doesn't open, visit:\n\n  {url}\n");
-    let _ = std::process::Command::new("open").arg(&url).spawn();
+    open_browser(&url);
 
     print!("After approving, paste the code shown (looks like `abc…#state`): ");
     use std::io::Write;
@@ -405,8 +405,6 @@ fn cmd_whoami() -> Result<()> {
 }
 
 async fn cmd_run(name: &str, args: Vec<String>) -> Result<()> {
-    use std::os::unix::process::CommandExt;
-
     let store = Store::load()?;
     let profile = store
         .profiles
@@ -428,13 +426,27 @@ async fn cmd_run(name: &str, args: Vec<String>) -> Result<()> {
 
     let base = format!("{}/a/{name}", daemon::base_url());
     eprintln!("launching Claude Code as `{name}`…");
-    let err = std::process::Command::new("claude")
-        .env("CLAUDE_CONFIG_DIR", &home)
+    let mut cmd = std::process::Command::new("claude");
+    cmd.env("CLAUDE_CONFIG_DIR", &home)
         .env("ANTHROPIC_BASE_URL", &base)
         .env_remove("ANTHROPIC_AUTH_TOKEN")
-        .args(&args)
-        .exec();
-    Err(anyhow::anyhow!("failed to launch claude: {err}"))
+        .args(&args);
+
+    // Replace this process with claude where we can; elsewhere run it as a
+    // child and mirror its exit code.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        let err = cmd.exec();
+        Err(anyhow::anyhow!("failed to launch claude: {err}"))
+    }
+    #[cfg(not(unix))]
+    {
+        let status = cmd
+            .status()
+            .map_err(|e| anyhow::anyhow!("failed to launch claude: {e}"))?;
+        std::process::exit(status.code().unwrap_or(1));
+    }
 }
 
 fn cmd_use(name: Option<String>, default: bool, pid: Option<u32>) -> Result<()> {
@@ -511,7 +523,7 @@ fn cmd_teardown() -> Result<()> {
         Ok(n) if n > 0 => println!("✓ removed {n} ccc instance(s) from t3code"),
         _ => {}
     }
-    match daemon::uninstall_launchd() {
+    match daemon::uninstall_autostart() {
         Ok(()) => println!("✓ stopped daemon"),
         Err(e) => eprintln!("note: could not stop daemon ({e:#})"),
     }
@@ -588,6 +600,25 @@ async fn cmd_doctor() -> Result<()> {
         println!("    {name}: {state}{has_refresh}");
     }
 
+    // Per-thread routing prerequisites (Linux: /proc, else lsof).
+    #[cfg(target_os = "linux")]
+    {
+        let has_proc = std::path::Path::new("/proc/net/tcp").exists();
+        let has_lsof = std::process::Command::new("lsof")
+            .arg("-v")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if has_proc {
+            println!("✓ per-thread routing via /proc");
+        } else if has_lsof {
+            println!("✓ per-thread routing via lsof");
+        } else {
+            ok = false;
+            println!("✗ neither /proc/net/tcp nor lsof available — per-thread routing won't work");
+        }
+    }
+
     // Skill.
     let skill = paths::claude_dir()?.join("skills/ccc/SKILL.md");
     if skill.exists() {
@@ -608,15 +639,26 @@ async fn cmd_doctor() -> Result<()> {
 }
 
 fn cmd_daemon_start(port: u16) -> Result<()> {
-    let path = daemon::install_launchd(port)?;
-    println!("✓ daemon started via launchd ({})", path.display());
+    let desc = daemon::install_autostart(port)?;
+    println!("✓ daemon started — {desc}");
     Ok(())
 }
 
 fn cmd_daemon_stop() -> Result<()> {
-    daemon::uninstall_launchd()?;
+    daemon::uninstall_autostart()?;
     println!("✓ daemon stopped");
     Ok(())
+}
+
+/// Open a URL in the default browser, best-effort.
+fn open_browser(url: &str) {
+    #[cfg(target_os = "macos")]
+    let cmd = "open";
+    #[cfg(target_os = "windows")]
+    let cmd = "explorer";
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let cmd = "xdg-open";
+    let _ = std::process::Command::new(cmd).arg(url).spawn();
 }
 
 fn cmd_daemon_status() -> Result<()> {
