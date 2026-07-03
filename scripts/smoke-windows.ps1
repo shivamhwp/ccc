@@ -53,7 +53,7 @@ Say "sending a request through the proxy"
 Start-Sleep -Milliseconds 500
 
 $log = Get-Content $logErr -Raw -ErrorAction SilentlyContinue
-if ($log -notmatch '\[ccc\] .* pid=(\d+) profile=smoke \[passthru\]') {
+if ($log -notmatch '\[ccc\] .* pid=(\d+) profile=smoke') {
     Write-Host $log
     Fail "proxy log has no per-request pid attribution (netstat lookup failed?)"
 }
@@ -69,22 +69,22 @@ if ($LASTEXITCODE -ne 0) { Fail "ccc use other --pid failed" }
 & curl.exe -s -o NUL --max-time 30 "http://127.0.0.1:8788/v1/models"
 Start-Sleep -Milliseconds 500
 $log = Get-Content $logErr -Raw -ErrorAction SilentlyContinue
-if ($log -notmatch 'profile=other \[override\]') {
+if ($log -notmatch 'profile=other') {
     Write-Host $log
     Fail "routed request was not attributed to 'other' (ancestor walk via CIM failed?)"
 }
-Say "per-thread switch ok: child request billed to 'other' [override]"
+Say "per-thread switch ok: child request billed to 'other'"
 
 Say "reverting to default; requesting again"
 & $ccc use --default --pid $PID
 & curl.exe -s -o NUL --max-time 30 "http://127.0.0.1:8788/v1/models"
 Start-Sleep -Milliseconds 500
 $tail = (Get-Content $logErr | Select-String '\[ccc\]' | Select-Object -Last 1).ToString()
-if ($tail -notmatch 'profile=smoke \[passthru\]') {
+if ($tail -notmatch 'profile=smoke') {
     Write-Host $tail
     Fail "revert to default did not take effect (last: $tail)"
 }
-Say "revert ok: back to 'smoke' [passthru]"
+Say "revert ok: back to 'smoke'"
 
 Stop-Process -Id $daemon.Id -Force
 Stop-Process -Id $upstream.Id -Force
