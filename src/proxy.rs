@@ -9,6 +9,11 @@
 //!      lock if needed),
 //!   4. forwards upstream with `Authorization: Bearer <subscription token>`
 //!      plus the `anthropic-beta: oauth-2025-04-20` header.
+//!
+//! The proxy injects the token on EVERY request — including the default
+//! account. ccc's store is the sole owner of all refresh tokens (Claude Code
+//! runs on seeded, never-refreshing credentials; see `creds`), so the daemon
+//! never reads the Keychain and no token can rotate out from under it.
 
 use anyhow::{Context, Result};
 use axum::body::Body;
@@ -31,6 +36,11 @@ use crate::{daemon, oauth};
 /// Refresh when within this many ms of expiry.
 const REFRESH_SKEW_MS: i64 = 120_000;
 
+/// After a failed refresh, don't retry the token endpoint for this long.
+/// `invalid_grant` is permanent until the user re-auths — without this, every
+/// request would hammer the endpoint with a known-dead refresh token.
+const REFRESH_BACKOFF: std::time::Duration = std::time::Duration::from_secs(30);
+
 #[derive(Clone)]
 struct AppState {
     client: reqwest::Client,
@@ -39,6 +49,8 @@ struct AppState {
     log: bool,
     /// Per-profile locks to serialize token refresh.
     locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+    /// Per-profile time of the last failed refresh, for backoff.
+    refresh_failures: Arc<Mutex<HashMap<String, std::time::Instant>>>,
 }
 
 /// Run the proxy on `port` until the process is terminated.
@@ -53,6 +65,7 @@ pub async fn run(port: u16) -> Result<()> {
         self_pid: procinfo::self_pid(),
         log: std::env::var("CCC_LOG").is_ok(),
         locks: Arc::new(Mutex::new(HashMap::new())),
+        refresh_failures: Arc::new(Mutex::new(HashMap::new())),
     };
 
     let app = Router::new()
@@ -91,7 +104,7 @@ async fn proxy(
         Ok(resp) => resp,
         Err(e) => {
             let msg = format!("ccc proxy error: {e:#}");
-            eprintln!("{msg}");
+            eprintln!("[{}] {msg}", utc_now());
             (StatusCode::BAD_GATEWAY, msg).into_response()
         }
     }
@@ -117,18 +130,9 @@ async fn proxy_inner(
         _ => resolve_profile(peer.port(), state.self_pid)?,
     };
 
-    // Token-ownership rule: ccc overrides the auth header only when the request
-    // is explicitly pinned (t3code) or routed to a non-default account
-    // (`ccc use <other>`). For the default account on an unpinned request, the
-    // caller is using its own real Claude login — pass it through untouched so
-    // Claude Code keeps managing that login (accurate `/status`, no refresh
-    // conflict, no need for a placeholder token).
-    let is_default = store.default_profile.as_deref() == Some(profile_name.as_str());
-    let override_auth = pin.is_some() || !is_default;
-
     if state.log {
         eprintln!(
-            "[ccc] {} {} pid={} profile={}{} {}",
+            "[ccc] {} {} pid={} profile={}{}",
             method,
             uri.path(),
             matched_pid
@@ -136,11 +140,6 @@ async fn proxy_inner(
                 .unwrap_or_else(|| "?".into()),
             profile_name,
             if pin.is_some() { " (pinned)" } else { "" },
-            if override_auth {
-                "[override]"
-            } else {
-                "[passthru]"
-            },
         );
     }
 
@@ -160,16 +159,16 @@ async fn proxy_inner(
     }
     fwd.remove(axum::http::header::HOST);
 
-    if override_auth {
-        let token = ensure_fresh_token(&state, &profile_name).await?;
-        fwd.remove("x-api-key");
-        fwd.insert(
-            axum::http::header::AUTHORIZATION,
-            HeaderValue::from_str(&format!("Bearer {token}"))?,
-        );
-        inject_beta(&mut fwd)?;
-    }
-    // else: pass the caller's own Authorization header through unchanged.
+    // Always inject the resolved profile's token. Callers run on seeded (stale
+    // by design) credentials, so their own Authorization header is never valid
+    // upstream.
+    let token = ensure_fresh_token(&state, &profile_name).await?;
+    fwd.remove("x-api-key");
+    fwd.insert(
+        axum::http::header::AUTHORIZATION,
+        HeaderValue::from_str(&format!("Bearer {token}"))?,
+    );
+    inject_beta(&mut fwd)?;
 
     let body_stream = body.into_data_stream();
     let reqwest_body = reqwest::Body::wrap_stream(body_stream);
@@ -240,22 +239,11 @@ fn resolve_profile(peer_port: u16, self_pid: u32) -> Result<(String, Option<u32>
 }
 
 /// Return a currently-valid access token for `profile`, refreshing if needed.
+/// The ccc store is the single source of truth for every profile, default
+/// included — the daemon never touches Claude Code's own credential storage.
 async fn ensure_fresh_token(state: &AppState, profile: &str) -> Result<String> {
     {
         let store = Store::load()?;
-        // The default account is owned by Claude Code (Keychain / credentials
-        // file), which keeps it fresh. Read the live token from there rather
-        // than refreshing a separate copy — refreshing would rotate the token
-        // out from under the user's normal Claude login. ccc only actively
-        // refreshes non-default accounts (its own store).
-        if store.default_profile.as_deref() == Some(profile) {
-            if let Ok(v) = crate::store::read_keychain_login() {
-                if let Some(tok) = v.get("accessToken").and_then(|t| t.as_str()) {
-                    return Ok(tok.to_string());
-                }
-            }
-            // Fall through to the stored copy if the Keychain read fails.
-        }
         let p = store
             .profiles
             .get(profile)
@@ -288,14 +276,60 @@ async fn ensure_fresh_token(state: &AppState, profile: &str) -> Result<String> {
         return Ok(current.access_token);
     }
 
-    let refreshed = oauth::refresh(&current).await?;
-    let token = refreshed.access_token.clone();
-    let profile_owned = profile.to_string();
-    Store::update(move |s| {
-        s.profiles.insert(profile_owned, refreshed);
-        Ok(())
-    })?;
-    Ok(token)
+    if let Some(failed_at) = state.refresh_failures.lock().await.get(profile) {
+        if failed_at.elapsed() < REFRESH_BACKOFF {
+            anyhow::bail!(
+                "token refresh for `{profile}` failed recently; backing off. \
+                 If this persists, re-auth with `ccc login {profile}`"
+            );
+        }
+    }
+
+    match oauth::refresh(&current).await {
+        Ok(refreshed) => {
+            state.refresh_failures.lock().await.remove(profile);
+            let token = refreshed.access_token.clone();
+            let profile_owned = profile.to_string();
+            Store::update(move |s| {
+                s.profiles.insert(profile_owned, refreshed);
+                Ok(())
+            })?;
+            Ok(token)
+        }
+        Err(e) => {
+            state
+                .refresh_failures
+                .lock()
+                .await
+                .insert(profile.to_string(), std::time::Instant::now());
+            Err(e.context(format!(
+                "refreshing token for `{profile}` (re-auth with `ccc login {profile}` if this persists)"
+            )))
+        }
+    }
+}
+
+/// Current UTC time as `YYYY-MM-DD HH:MM:SS` — enough for correlating log
+/// lines without pulling in a date dependency.
+fn utc_now() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let (days, rem) = (secs / 86_400, secs % 86_400);
+    let (hh, mm, ss) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+    // Civil date from day count (Howard Hinnant's algorithm).
+    let z = days as i64 + 719_468;
+    let era = z / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{y:04}-{m:02}-{d:02} {hh:02}:{mm:02}:{ss:02}")
 }
 
 fn inject_beta(headers: &mut HeaderMap) -> Result<()> {

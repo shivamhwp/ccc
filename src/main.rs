@@ -4,6 +4,7 @@
 //! local proxy (the daemon) rewrites each thread's requests to authenticate as
 //! a chosen saved account, selected via a PID-based route table.
 
+mod creds;
 mod daemon;
 mod oauth;
 mod oauthcfg;
@@ -184,15 +185,27 @@ fn cmd_t3_unsync() -> Result<()> {
 async fn cmd_setup() -> Result<()> {
     paths::ensure_ccc_dir()?;
 
-    // 1. Import current login if we have no profiles yet.
+    // 1. Import the current login and take ownership of its tokens. Idempotent:
+    //    a seeded login means a previous setup already did this. A LIVE login on
+    //    re-setup is re-imported into the default profile — that heals a store
+    //    copy that went stale while Claude Code still owned the grant.
     let store = Store::load()?;
-    if store.profiles.is_empty() {
-        match cmd_import("default") {
-            Ok(()) => {}
-            Err(e) => eprintln!(
-                "note: could not import an existing Claude login ({e:#}).\n      Run `ccc login <name>` to add an account."
-            ),
+    match creds::read_login() {
+        Ok(v) if creds::is_seeded(&v) => {
+            println!("✓ Claude Code login already ccc-managed");
         }
+        Ok(_) => {
+            let name = store
+                .resolve_default()
+                .map(str::to_string)
+                .unwrap_or_else(|| "default".into());
+            if let Err(e) = cmd_import(&name) {
+                eprintln!("note: could not import the Claude login ({e:#}).\n      Run `ccc login <name>` to add an account.");
+            }
+        }
+        Err(e) => eprintln!(
+            "note: no existing Claude login found ({e:#}).\n      Run `ccc login <name>` to add an account."
+        ),
     }
 
     // 2. Start the daemon (launchd / systemd / detached fallback).
@@ -327,7 +340,13 @@ fn save_login(name: &str, mut profile: store::Profile) -> Result<()> {
 }
 
 fn cmd_import(name: &str) -> Result<()> {
-    let oauth_val = store::read_keychain_login()?;
+    let oauth_val = creds::read_login()?;
+    if creds::is_seeded(&oauth_val) {
+        anyhow::bail!(
+            "the current Claude Code login is already ccc-managed (its live tokens are in \
+             the ccc store). Add another account with `ccc login <name>`."
+        );
+    }
     let mut profile = store::profile_from_oauth(&oauth_val)?;
     if let Some(id) = store::read_claude_identity() {
         profile.email = id
@@ -347,6 +366,7 @@ fn cmd_import(name: &str) -> Result<()> {
             .and_then(|v| v.as_str())
             .map(str::to_string);
     }
+    let seeded = profile.clone();
     let name_owned = name.to_string();
     Store::update(move |s| {
         let first = s.profiles.is_empty();
@@ -356,7 +376,18 @@ fn cmd_import(name: &str) -> Result<()> {
         }
         Ok(())
     })?;
-    println!("✓ imported current Claude login as `{name}`");
+    // Take ownership: overwrite Claude Code's copy with a far-future seed so it
+    // never refreshes. Refresh tokens rotate on use — if both Claude Code and
+    // ccc kept refreshing the same grant, whichever refreshed second would be
+    // left with a dead token. Store first, seed second: a failure here leaves
+    // the pre-import status quo (Claude Code still owns its login).
+    creds::write_login(&seeded, creds::FAR_FUTURE_MS).with_context(|| {
+        format!(
+            "imported `{name}`, but seeding Claude Code's credentials failed — \
+             re-run `ccc import {name}` so ccc owns the tokens"
+        )
+    })?;
+    println!("✓ imported current Claude login as `{name}` (ccc now manages its tokens)");
     Ok(())
 }
 
@@ -530,6 +561,24 @@ fn cmd_remove(name: &str) -> Result<()> {
 fn cmd_teardown() -> Result<()> {
     setup::unpatch_settings()?;
     println!("✓ reverted Claude Code settings.json");
+    // Hand the login back: replace the seed with the live tokens (real expiry)
+    // so Claude Code resumes refreshing on its own once the proxy is gone.
+    if let Ok(v) = creds::read_login() {
+        if creds::is_seeded(&v) {
+            let store = Store::load()?;
+            match store.resolve_default().and_then(|n| store.profiles.get(n)) {
+                Some(p) => match creds::write_login(p, p.expires_at) {
+                    Ok(()) => println!("✓ restored live login to Claude Code"),
+                    Err(e) => eprintln!(
+                        "note: could not restore the Claude Code login ({e:#}) — run /login in claude"
+                    ),
+                },
+                None => eprintln!(
+                    "note: no default account to restore — run /login in claude to re-auth"
+                ),
+            }
+        }
+    }
     setup::remove_skill()?;
     println!("✓ removed agent skill");
     match t3::unsync() {
@@ -589,6 +638,23 @@ async fn cmd_doctor() -> Result<()> {
             ok = false;
             println!("✗ no settings.json at {}", settings_path.display());
         }
+    }
+
+    // Credential ownership: Claude Code's stored login should be a ccc seed.
+    // A live login there keeps refreshing its grant, which would eventually
+    // rotate a shared refresh token out from under the ccc store.
+    match creds::read_login() {
+        Ok(v) if creds::is_seeded(&v) => {
+            println!("✓ Claude Code login is ccc-managed (seeded)");
+        }
+        Ok(_) => {
+            ok = false;
+            println!(
+                "✗ Claude Code holds a live login (not ccc-managed) — run `ccc setup` to \
+                 re-import it and take ownership"
+            );
+        }
+        Err(_) => println!("• no Claude Code login found (ok — the proxy authenticates requests)"),
     }
 
     // Profiles.
