@@ -297,11 +297,16 @@ async fn ensure_fresh_token(state: &AppState, profile: &str) -> Result<String> {
             Ok(token)
         }
         Err(e) => {
-            state
-                .refresh_failures
-                .lock()
-                .await
-                .insert(profile.to_string(), std::time::Instant::now());
+            // Back off only on permanent auth failures (invalid/rotated-away
+            // refresh token). Transient errors — timeouts, 5xx — should retry
+            // on the next request, not lock the profile out for 30s.
+            if format!("{e:#}").contains("invalid_grant") {
+                state
+                    .refresh_failures
+                    .lock()
+                    .await
+                    .insert(profile.to_string(), std::time::Instant::now());
+            }
             Err(e.context(format!(
                 "refreshing token for `{profile}` (re-auth with `ccc login {profile}` if this persists)"
             )))

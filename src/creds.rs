@@ -92,23 +92,33 @@ pub fn write_login(profile: &Profile, expires_at: i64) -> Result<()> {
 
 #[cfg(target_os = "macos")]
 fn write_login_raw(data: &str) -> Result<()> {
+    use std::io::Write;
     // The item's account attribute matches the login user (Claude Code sets it
     // to $USER). `-U` updates the existing item in place, preserving its ACL so
-    // Claude Code keeps silent read access to its own credentials.
+    // Claude Code keeps silent read access to its own credentials. The command
+    // goes through `security -i` stdin — as an argv the credential blob would
+    // be visible in the process list for the duration of the write.
     let user = std::env::var("USER").unwrap_or_else(|_| "claude".into());
-    let out = std::process::Command::new("security")
-        .args([
-            "add-generic-password",
-            "-U",
-            "-s",
-            "Claude Code-credentials",
-            "-a",
-            &user,
-            "-w",
-            data,
-        ])
-        .output()
+    let quote = |s: &str| format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""));
+    let cmd = format!(
+        "add-generic-password -U -s \"Claude Code-credentials\" -a {} -w {}\n",
+        quote(&user),
+        quote(data),
+    );
+    let mut child = std::process::Command::new("security")
+        .arg("-i")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
         .context("running `security` to write Keychain")?;
+    child
+        .stdin
+        .take()
+        .expect("piped stdin")
+        .write_all(cmd.as_bytes())
+        .context("sending credentials to `security`")?;
+    let out = child.wait_with_output()?;
     if !out.status.success() {
         return Err(anyhow!(
             "writing Claude Code credentials to Keychain failed: {}",
@@ -124,8 +134,27 @@ fn write_login_raw(data: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(&path, data).with_context(|| format!("writing {}", path.display()))?;
-    paths::set_mode(&path, 0o600)?;
+    write_secret_file(&path, data.as_bytes())
+}
+
+/// Write a credentials file created with 0600 from the start — `fs::write`
+/// followed by chmod would leave a window where the default umask applies.
+pub fn write_secret_file(path: &std::path::Path, data: &[u8]) -> Result<()> {
+    use std::io::Write;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true).truncate(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts
+        .open(path)
+        .with_context(|| format!("creating {}", path.display()))?;
+    f.write_all(data)
+        .with_context(|| format!("writing {}", path.display()))?;
+    // mode() only applies on create; tighten pre-existing files too.
+    crate::paths::set_mode(path, 0o600)?;
     Ok(())
 }
 

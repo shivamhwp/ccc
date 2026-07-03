@@ -111,8 +111,7 @@ pub async fn provision_home(account: &str, profile: &Profile) -> Result<PathBuf>
     seeded.subscription_type = sub.clone().or(seeded.subscription_type);
     let cred = creds::oauth_json(&seeded, creds::FAR_FUTURE_MS);
     let cred_path = home.join(".credentials.json");
-    std::fs::write(&cred_path, serde_json::to_vec(&cred)?)?;
-    paths::set_mode(&cred_path, 0o600)?;
+    creds::write_secret_file(&cred_path, &serde_json::to_vec(&cred)?)?;
 
     Ok(home)
 }
