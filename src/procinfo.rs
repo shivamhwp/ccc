@@ -376,6 +376,45 @@ pub fn command_of(pid: u32) -> String {
         .unwrap_or_default()
 }
 
+/// Opaque token identifying when `pid` started, stable for the process's
+/// lifetime. Routes record it so a pid recycled by the OS (same number, new
+/// process) no longer matches. None when the process is gone or the platform
+/// query fails.
+#[cfg(target_os = "linux")]
+pub fn pid_start_token(pid: u32) -> Option<String> {
+    // Field 22 of /proc/<pid>/stat is starttime (clock ticks since boot).
+    // comm (field 2) may contain spaces and parens, so split after the last
+    // closing paren: state is the next token, starttime the 20th.
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let (_, after) = stat.rsplit_once(')')?;
+    after.split_whitespace().nth(19).map(str::to_string)
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+pub fn pid_start_token(pid: u32) -> Option<String> {
+    let out = std::process::Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "lstart="])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!s.is_empty()).then_some(s)
+}
+
+#[cfg(windows)]
+pub fn pid_start_token(pid: u32) -> Option<String> {
+    let script =
+        format!("(Get-Process -Id {pid} -ErrorAction SilentlyContinue).StartTime.ToFileTime()");
+    let out = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .output()
+        .ok()?;
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!s.is_empty()).then_some(s)
+}
+
 /// True if a process with this pid currently exists.
 #[cfg(not(windows))]
 pub fn pid_alive(pid: u32) -> bool {
@@ -407,6 +446,14 @@ pub fn self_pid() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn start_token_is_stable_for_a_live_process() {
+        let me = self_pid();
+        let a = pid_start_token(me);
+        assert!(a.is_some(), "start token for our own pid must resolve");
+        assert_eq!(a, pid_start_token(me));
+    }
 
     #[test]
     fn picks_client_pid_by_local_port() {

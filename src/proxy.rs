@@ -127,7 +127,13 @@ async fn proxy_inner(
     let store = Store::load()?;
     let (profile_name, matched_pid) = match pin {
         Some(ref name) if store.profiles.contains_key(name) => (name.clone(), None),
-        _ => resolve_profile(peer.port(), state.self_pid)?,
+        // A pin names an account explicitly; never substitute another one —
+        // falling back here would silently bill a different account.
+        Some(name) => anyhow::bail!(
+            "pinned account `{name}` is not saved — check `ccc list` \
+             (for t3code instances, re-run `ccc t3 sync`)"
+        ),
+        None => resolve_profile(peer.port(), state.self_pid)?,
     };
 
     if state.log {

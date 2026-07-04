@@ -19,6 +19,20 @@ use crate::store::now_ms;
 pub struct Route {
     pub profile: String,
     pub set_at: i64,
+    /// Start token of the routed process, recorded by `ccc use`. Guards
+    /// against pid reuse: the OS recycles pids, and a stale route must not
+    /// attach an account to an unrelated new process with the same number.
+    #[serde(default)]
+    pub started: Option<String>,
+}
+
+/// True when `route` still refers to the same live process it was set for.
+/// Legacy routes without a start token fall back to a liveness check.
+fn still_owns(pid: u32, route: &Route) -> bool {
+    match &route.started {
+        Some(token) => procinfo::pid_start_token(pid).as_deref() == Some(token.as_str()),
+        None => procinfo::pid_alive(pid),
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -49,12 +63,16 @@ impl Routes {
             return None;
         }
         if let Some(r) = self.routes.get(&claude_pid.to_string()) {
-            return Some(r.profile.clone());
+            if still_owns(claude_pid, r) {
+                return Some(r.profile.clone());
+            }
         }
         let chain = procinfo::ancestors(claude_pid);
         for pid in chain {
             if let Some(r) = self.routes.get(&pid.to_string()) {
-                return Some(r.profile.clone());
+                if still_owns(pid, r) {
+                    return Some(r.profile.clone());
+                }
             }
         }
         None
@@ -103,9 +121,11 @@ pub fn update<T>(f: impl FnOnce(&mut Routes) -> Result<T>) -> Result<T> {
 }
 
 fn gc(routes: &mut Routes) {
-    routes
-        .routes
-        .retain(|pid, _| pid.parse::<u32>().map(procinfo::pid_alive).unwrap_or(false));
+    routes.routes.retain(|pid, route| {
+        pid.parse::<u32>()
+            .map(|p| still_owns(p, route))
+            .unwrap_or(false)
+    });
 }
 
 /// Set (or clear) the route for a specific pid.
@@ -118,6 +138,7 @@ pub fn set_route(pid: u32, profile: Option<&str>) -> Result<()> {
                     Route {
                         profile: p.to_string(),
                         set_at: now_ms(),
+                        started: procinfo::pid_start_token(pid),
                     },
                 );
             }
@@ -128,4 +149,45 @@ pub fn set_route(pid: u32, profile: Option<&str>) -> Result<()> {
         Ok(())
     })
     .context("updating routes")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::procinfo;
+
+    fn route(profile: &str, started: Option<String>) -> Route {
+        Route {
+            profile: profile.into(),
+            set_at: 0,
+            started,
+        }
+    }
+
+    #[test]
+    fn still_owns_requires_matching_start_token() {
+        let me = procinfo::self_pid();
+        // Correct token: the route still owns the pid.
+        assert!(still_owns(me, &route("x", procinfo::pid_start_token(me))));
+        // Recycled pid (token mismatch): it doesn't.
+        assert!(!still_owns(me, &route("x", Some("bogus-token".into()))));
+        // Legacy route without a token: liveness is enough.
+        assert!(still_owns(me, &route("x", None)));
+    }
+
+    #[test]
+    fn resolve_skips_route_for_recycled_pid() {
+        let me = procinfo::self_pid();
+        let mut routes = Routes::default();
+        routes
+            .routes
+            .insert(me.to_string(), route("stale", Some("bogus-token".into())));
+        assert_eq!(routes.resolve_for(me), None);
+
+        // Same entry with the real token resolves.
+        routes
+            .routes
+            .insert(me.to_string(), route("live", procinfo::pid_start_token(me)));
+        assert_eq!(routes.resolve_for(me), Some("live".into()));
+    }
 }
