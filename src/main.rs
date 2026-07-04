@@ -15,6 +15,7 @@ mod routes;
 mod setup;
 mod store;
 mod t3;
+mod vault;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -96,6 +97,19 @@ enum Command {
         #[command(subcommand)]
         action: T3Action,
     },
+    /// Export / import the decrypted account store (backup, machine migration).
+    Store {
+        #[command(subcommand)]
+        action: StoreAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum StoreAction {
+    /// Write the decrypted store JSON to a file (or stdout with `-`).
+    Export { path: String },
+    /// Replace the store with the JSON from a file (or stdin with `-`).
+    Import { path: String },
 }
 
 #[derive(Subcommand)]
@@ -160,7 +174,58 @@ async fn run() -> Result<()> {
             T3Action::Sync => cmd_t3_sync().await,
             T3Action::Unsync => cmd_t3_unsync(),
         },
+        Command::Store { action } => match action {
+            StoreAction::Export { path } => cmd_store_export(&path),
+            StoreAction::Import { path } => cmd_store_import(&path),
+        },
     }
+}
+
+/// Export the decrypted store — for backups, machine migration, and the smoke
+/// tests. The output holds live tokens; a file lands with 0600 perms and a
+/// warning, stdout is the caller's responsibility.
+fn cmd_store_export(path: &str) -> Result<()> {
+    let store = Store::load()?;
+    let json = serde_json::to_vec_pretty(&store)?;
+    if path == "-" {
+        use std::io::Write;
+        std::io::stdout().write_all(&json)?;
+        std::io::stdout().write_all(b"\n")?;
+    } else {
+        creds::write_secret_file(std::path::Path::new(path), &json)?;
+        eprintln!(
+            "✓ exported to {path} — this file holds live tokens; keep or delete it accordingly"
+        );
+    }
+    Ok(())
+}
+
+fn cmd_store_import(path: &str) -> Result<()> {
+    let bytes = if path == "-" {
+        use std::io::Read;
+        let mut buf = Vec::new();
+        std::io::stdin().read_to_end(&mut buf)?;
+        buf
+    } else {
+        std::fs::read(path).with_context(|| format!("reading {path}"))?
+    };
+    let imported: Store = serde_json::from_slice(&bytes).context("parsing store JSON")?;
+    let n = imported.profiles.len();
+    Store::update(move |s| {
+        // Import replaces the whole store; refuse to wipe saved accounts with
+        // an empty one (every Store field is serde-default, so `{}` parses).
+        if imported.profiles.is_empty() && !s.profiles.is_empty() {
+            anyhow::bail!(
+                "the imported store has no profiles, but {} account(s) are saved — \
+                 refusing to wipe them (use `ccc remove <name>` to delete accounts)",
+                s.profiles.len()
+            );
+        }
+        *s = imported;
+        Ok(())
+    })?;
+    println!("✓ imported store ({n} account(s))");
+    Ok(())
 }
 
 async fn cmd_t3_sync() -> Result<()> {
@@ -184,6 +249,9 @@ fn cmd_t3_unsync() -> Result<()> {
 
 async fn cmd_setup() -> Result<()> {
     paths::ensure_ccc_dir()?;
+    if Store::migrate_plaintext()? {
+        println!("✓ migrated plaintext store.json to encrypted store.enc");
+    }
 
     // 1. Import the current login and take ownership of its tokens. Idempotent:
     //    a seeded login means a previous setup already did this. A LIVE login on

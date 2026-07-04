@@ -159,6 +159,87 @@ fn write_login_raw(data: &str) -> Result<()> {
     write_secret_file(&path, data.as_bytes())
 }
 
+/// Outcome of [`reconcile`]: the relationship between Claude Code's stored
+/// login and the ccc store.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+#[derive(Debug)]
+pub enum Reconcile {
+    /// No Claude Code login stored at all.
+    NoLogin,
+    /// The stored login is a ccc seed — ownership is intact.
+    Seeded,
+    /// A live login matching a saved profile was re-imported and re-seeded.
+    Healed(String),
+    /// A live login for an account ccc doesn't know. Left untouched.
+    Foreign { email: Option<String> },
+}
+
+/// Detect a live (non-seed) Claude Code login — the state `/login` leaves
+/// behind — and re-take ownership when it belongs to a saved profile: adopt
+/// its tokens into the store, then re-seed. Without this, Claude Code resumes
+/// refreshing the grant and the rotation eventually strands the store's copy.
+///
+/// Called periodically by the daemon on Linux/Windows, where the login is a
+/// plain file. Not called on macOS: the daemon must never touch the Keychain
+/// (ACL prompts), so detection there is `ccc doctor` / `ccc setup` plus the
+/// `invalid_grant` error hint.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+pub fn reconcile() -> Result<Reconcile> {
+    let login = match read_login() {
+        Ok(v) => v,
+        Err(_) => return Ok(Reconcile::NoLogin),
+    };
+    if is_seeded(&login) {
+        return Ok(Reconcile::Seeded);
+    }
+
+    // A live login. Identify the account (written by /login alongside the
+    // credentials) and find the saved profile it belongs to.
+    let identity = crate::store::read_claude_identity();
+    let get = |k: &str| {
+        identity
+            .as_ref()
+            .and_then(|id| id.get(k))
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+    };
+    let (uuid, email) = (get("accountUuid"), get("emailAddress"));
+
+    let store = crate::store::Store::load()?;
+    let matched = store.profiles.iter().find_map(|(name, p)| {
+        let by_uuid = uuid.is_some() && p.account_uuid == uuid;
+        let by_email = email.is_some() && p.email == email;
+        (by_uuid || by_email).then(|| name.clone())
+    });
+    let Some(name) = matched else {
+        // Never adopt tokens for an account we can't attribute — that would
+        // overwrite a saved profile with a stranger's login.
+        return Ok(Reconcile::Foreign { email });
+    };
+
+    let mut live = crate::store::profile_from_oauth(&login)?;
+    let old = &store.profiles[&name];
+    live.email = email.or_else(|| old.email.clone());
+    live.account_uuid = uuid.or_else(|| old.account_uuid.clone());
+    live.organization_uuid = old.organization_uuid.clone();
+    live.organization_name = old.organization_name.clone();
+    if live.subscription_type.is_none() {
+        live.subscription_type = old.subscription_type.clone();
+    }
+
+    // Store first, seed second — same ordering as `ccc import`: a failure
+    // between the two leaves Claude Code owning a login the store also has,
+    // which the next reconcile pass repairs.
+    let seeded = live.clone();
+    let profile_name = name.clone();
+    crate::store::Store::update(move |s| {
+        s.profiles.insert(profile_name, live);
+        Ok(())
+    })?;
+    write_login(&seeded, FAR_FUTURE_MS)?;
+    Ok(Reconcile::Healed(name))
+}
+
 /// Write a credentials file created with 0600 from the start — `fs::write`
 /// followed by chmod would leave a window where the default umask applies.
 pub fn write_secret_file(path: &std::path::Path, data: &[u8]) -> Result<()> {

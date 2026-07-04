@@ -16,7 +16,6 @@ PORT="${CCC_SMOKE_PORT:-8799}"
 BAD="ccc-smoke-bad"
 CCC="${CCC_BIN:-$(dirname "$0")/../target/debug/ccc}"
 REQ='{"model":"claude-haiku-4-5-20251001","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}'
-STORE="$HOME/.ccc/store.json"
 
 say() { printf '\n\033[1m== %s\033[0m\n' "$1"; }
 fail() { printf '\033[31mFAIL: %s\033[0m\n' "$1"; exit 1; }
@@ -30,8 +29,11 @@ printf '%s\n' "$LIST_OUT" | grep -q 'PROFILE' || fail "no accounts saved; run 'c
 printf '%s\n' "$LIST_OUT" | grep -q '(default)' || fail "no default account set"
 
 # --- craft a throwaway broken profile (copy default, corrupt the token) ------
+# The store is encrypted at rest, so edits go through `ccc store export/import`.
 say "adding throwaway broken profile '$BAD'"
-python3 - "$STORE" "$BAD" <<'PY'
+TMP_STORE="$(mktemp)"
+"$CCC" store export "$TMP_STORE" 2>/dev/null
+python3 - "$TMP_STORE" "$BAD" <<'PY'
 import json, sys
 store_path, bad = sys.argv[1], sys.argv[2]
 d = json.load(open(store_path))
@@ -44,6 +46,8 @@ p["email"] = "smoke@invalid"
 d["profiles"][bad] = p
 json.dump(d, open(store_path, "w"), indent=2)
 PY
+"$CCC" store import "$TMP_STORE" >/dev/null
+rm -f "$TMP_STORE"
 
 cleanup() {
   "$CCC" use --default --pid "$$" >/dev/null 2>&1 || true
