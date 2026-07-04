@@ -65,6 +65,7 @@ That's it — the account is live for that thread within a couple of seconds, an
 | `ccc default <name>` | Set the fallback account |
 | `ccc remove <name>` | Remove a saved account |
 | `ccc doctor` | Verify daemon, settings, and auth path |
+| `ccc store export \| import <path>` | Back up / restore the decrypted account store (`-` for stdio) |
 | `ccc daemon run \| start \| stop \| status` | Control the local proxy daemon |
 | `ccc t3 sync \| unsync` | Add/remove one [t3code](https://github.com/pingdotgg/t3code) provider instance per account |
 | `ccc teardown` | Undo `ccc setup` (revert settings, hand the login back to Claude Code, remove skill, stop daemon) |
@@ -85,7 +86,9 @@ That's it — the account is live for that thread within a couple of seconds, an
 
 Because selection happens per request, `ccc use <name>` changes the account for the current thread instantly — no restart, and independent of your shell (routing is process-based).
 
-**Credential ownership.** Anthropic rotates refresh tokens on use, so a token shared by two refreshers breaks whichever refreshes second. ccc therefore owns every saved account's tokens outright: `ccc setup` (or `ccc import`) copies the live login into `~/.ccc/store.json` once, then overwrites Claude Code's own credentials with a far-future-expiry copy. Claude Code sees a login that never expires — it stays "logged in" (correct account in `/status`), never refreshes, and never touches the Keychain — while the proxy injects the real, ccc-refreshed token on every request. `ccc teardown` writes the live tokens back, returning ownership to Claude Code.
+**Credential ownership.** Anthropic rotates refresh tokens on use, so a token shared by two refreshers breaks whichever refreshes second. ccc therefore owns every saved account's tokens outright: `ccc setup` (or `ccc import`) copies the live login into ccc's encrypted store once, then overwrites Claude Code's own credentials with a far-future-expiry copy. Claude Code sees a login that never expires — it stays "logged in" (correct account in `/status`), never refreshes, and never touches the Keychain — while the proxy injects the real, ccc-refreshed token on every request. `ccc teardown` writes the live tokens back, returning ownership to Claude Code.
+
+If a `/login` in Claude Code replaces the seed with a live grant, the daemon detects it on Linux/Windows and automatically re-imports + re-seeds (matching the account by uuid/email; unknown accounts are left alone). On macOS the daemon never touches the Keychain, so `ccc doctor` / `ccc setup` flag and fix it instead.
 
 ## For your agents
 
@@ -108,16 +111,17 @@ Because selection happens per request, `ccc use <name>` changes the account for 
 ## Testing
 
 ```sh
-cargo test                    # unit: lsof + /proc/net/tcp + netstat parsing, PKCE, store/refresh, routing
-./scripts/smoke.sh            # end-to-end (macOS/Linux): proves auth + per-thread routing, then cleans up
+cargo test                    # unit: lsof + /proc/net/tcp + netstat parsing, PKCE, store/refresh, vault, routing
+./scripts/e2e.sh              # hermetic e2e (macOS/Linux, also in CI): routing, refresh/rotation, store encryption, seed watcher — mock endpoints, no real account
+./scripts/smoke.sh            # end-to-end (macOS/Linux): proves real auth + per-thread routing against your account, then cleans up
 ./scripts/smoke-windows.ps1   # end-to-end (Windows): autostart lifecycle + routing attribution (also runs in CI)
 ```
 
 ## Files & configuration
 
-State lives in `~/.ccc/`: `store.json` (accounts + subscription tokens, `0600`), `routes.json` (live PID → account), `daemon.json` (pid + port). The autostart agent lives at `~/Library/LaunchAgents/ing.shivam.ccc.plist` (macOS), `~/.config/systemd/user/ccc.service` (Linux), or the `ccc` value under `HKCU\...\CurrentVersion\Run` plus `~/.ccc/ccc-daemon.vbs` (Windows).
+State lives in `~/.ccc/`: `store.enc` (accounts + subscription tokens, encrypted — see below), `store.enc.bak.1..3` (rotated pre-write backups), `routes.json` (live PID → account), `daemon.json` (pid + port). A pre-encryption `store.json` is migrated to `store.enc` (and shredded) on the next daemon start or setup. The autostart agent lives at `~/Library/LaunchAgents/ing.shivam.ccc.plist` (macOS), `~/.config/systemd/user/ccc.service` (Linux), or the `ccc` value under `HKCU\...\CurrentVersion\Run` plus `~/.ccc/ccc-daemon.vbs` (Windows).
 
-OAuth endpoints and the upstream base are overridable via `CCC_OAUTH_*` and `CCC_UPSTREAM_BASE` env vars (useful if a Claude Code update moves an endpoint). Set `CCC_LOG=1` on the daemon for a per-request routing log.
+OAuth endpoints and the upstream base are overridable via `CCC_OAUTH_*` and `CCC_UPSTREAM_BASE` env vars (useful if a Claude Code update moves an endpoint). Set `CCC_LOG=1` on the daemon for a per-request routing log. `CCC_SEED_CHECK_SECS` tunes the seed watcher cadence, `CCC_KEY_FILE` overrides where the store key lives.
 
 ## Releases
 
@@ -126,7 +130,8 @@ Push a tag `vX.Y.Z` → GitHub Actions builds macOS (arm64 + x64), Linux (x64 gn
 ## Security
 
 - Subscription tokens only — no API keys, ever.
-- Tokens stored at `~/.ccc/store.json` mode `0600` (Keychain-backed storage planned).
+- Tokens are encrypted at rest (`~/.ccc/store.enc`, XChaCha20-Poly1305). The key lives in the macOS Keychain, or in `~/.ccc/key` (`0600`) on Linux/Windows — matching those platforms' Claude Code credential storage model. `CCC_KEY_FILE` overrides the location.
+- Every store write rotates three backups, and `ccc store export` makes off-machine backup/migration possible — losing one file no longer means re-authing every account.
 - The proxy binds `127.0.0.1` only.
 
 ## License

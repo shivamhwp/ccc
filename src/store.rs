@@ -1,8 +1,14 @@
-//! Account + token store, persisted to `~/.ccc/store.json` (mode 0600).
+//! Account + token store, persisted encrypted to `~/.ccc/store.enc`.
 //!
 //! One entry per Claude account ("profile"). Tokens are claude.ai subscription
 //! OAuth tokens — the same `sk-ant-oat…` / `sk-ant-ort…` blobs Claude Code
 //! obtains via `/login`. No API keys are ever stored.
+//!
+//! At rest the store is sealed by the `vault` module (key in the Keychain or
+//! a 0600 key file). A legacy plaintext `store.json` is still readable; the
+//! first write migrates it to `store.enc` and shreds the plaintext. Every
+//! successful write also rotates `store.enc.bak.1..3` so a corrupted or
+//! deleted store is recoverable.
 
 use anyhow::{anyhow, Context, Result};
 use fs2::FileExt;
@@ -13,6 +19,10 @@ use std::io::{Read, Write};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::paths;
+use crate::vault;
+
+/// How many rotated backups of the encrypted store to keep.
+const BACKUPS: u32 = 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Profile {
@@ -59,6 +69,21 @@ fn one() -> u32 {
 
 impl Store {
     pub fn load() -> Result<Store> {
+        let enc_path = paths::store_enc_file()?;
+        if let Ok(bytes) = std::fs::read(&enc_path) {
+            if !bytes.is_empty() {
+                let key = vault::master_key().context("resolving the store encryption key")?;
+                let plain = vault::open(&key, &bytes).with_context(|| {
+                    format!(
+                        "reading {p} — if the file is corrupt, restore a backup: \
+                         cp {p}.bak.1 {p}",
+                        p = enc_path.display()
+                    )
+                })?;
+                return serde_json::from_slice(&plain).context("parsing decrypted store");
+            }
+        }
+        // Legacy plaintext store (pre-encryption, or not yet migrated).
         let path = paths::store_file()?;
         match std::fs::read(&path) {
             Ok(bytes) if !bytes.is_empty() => {
@@ -69,6 +94,19 @@ impl Store {
                 ..Default::default()
             }),
         }
+    }
+
+    /// One-time migration: if only the legacy plaintext store exists, rewrite
+    /// it as `store.enc` (a no-op update does load → sealed save → shred).
+    /// Returns true when a migration happened.
+    pub fn migrate_plaintext() -> Result<bool> {
+        let legacy = paths::store_file()?;
+        let enc = paths::store_enc_file()?;
+        if !legacy.exists() || enc.exists() {
+            return Ok(false);
+        }
+        Store::update(|_| Ok(()))?;
+        Ok(true)
     }
 
     /// Load, mutate under an exclusive file lock, and persist atomically.
@@ -96,21 +134,31 @@ impl Store {
     }
 
     fn save_atomic(&self) -> Result<()> {
-        let path = paths::store_file()?;
-        let tmp = path.with_extension("json.tmp");
-        let data = serde_json::to_vec_pretty(self)?;
+        let key = vault::master_key().context("resolving the store encryption key")?;
+        let path = paths::store_enc_file()?;
+        rotate_backups(&path);
+
+        let tmp = path.with_extension("enc.tmp");
+        let sealed = vault::seal(&key, &serde_json::to_vec_pretty(self)?)?;
         {
             let mut f = OpenOptions::new()
                 .create(true)
                 .write(true)
                 .truncate(true)
                 .open(&tmp)?;
-            f.write_all(&data)?;
+            f.write_all(&sealed)?;
             f.sync_all()?;
         }
         paths::set_mode(&tmp, 0o600)?;
         std::fs::rename(&tmp, &path)?;
         paths::set_mode(&path, 0o600)?;
+
+        // The sealed copy is durable; drop the legacy plaintext if present.
+        if let Ok(legacy) = paths::store_file() {
+            if legacy.exists() {
+                shred(&legacy);
+            }
+        }
         Ok(())
     }
 
@@ -126,6 +174,36 @@ impl Store {
                 }
             })
     }
+}
+
+/// Rotate `store.enc` → `.bak.1` → `.bak.2` → `.bak.3` before a write, so the
+/// last three pre-write states survive corruption or deletion. Best-effort:
+/// a failed rotation must never block a token write. The live file is copied
+/// (not renamed) so `store.enc` exists at every instant for concurrent reads.
+fn rotate_backups(path: &std::path::Path) {
+    if !path.exists() {
+        return;
+    }
+    let bak = |i: u32| path.with_extension(format!("enc.bak.{i}"));
+    for i in (1..BACKUPS).rev() {
+        let _ = std::fs::rename(bak(i), bak(i + 1));
+    }
+    if std::fs::copy(path, bak(1)).is_ok() {
+        let _ = paths::set_mode(&bak(1), 0o600);
+    }
+}
+
+/// Best-effort destruction of the legacy plaintext store: overwrite with
+/// zeros, sync, then remove — so the tokens don't linger on disk after the
+/// encrypted copy takes over.
+fn shred(path: &std::path::Path) {
+    if let Ok(meta) = std::fs::metadata(path) {
+        if let Ok(mut f) = OpenOptions::new().write(true).open(path) {
+            let _ = f.write_all(&vec![0u8; meta.len() as usize]);
+            let _ = f.sync_all();
+        }
+    }
+    let _ = std::fs::remove_file(path);
 }
 
 pub fn now_ms() -> i64 {

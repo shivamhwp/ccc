@@ -29,6 +29,23 @@ jobs:
       - name: Build
         run: cargo build --release
 
+  # Hermetic end-to-end: routing, token refresh/rotation, store encryption,
+  # and (Linux) the seed watcher — all against mock endpoints, no real account.
+  e2e:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build
+      - name: End-to-end (mocked upstream + token endpoint)
+        run: ./scripts/e2e.sh
+
   # End-to-end proof on a real Windows machine: Run-key autostart lifecycle
   # and per-request PID attribution through the proxy (netstat path).
   smoke-windows:

@@ -18,9 +18,15 @@ pub fn ccc_dir() -> Result<PathBuf> {
     Ok(home()?.join(".ccc"))
 }
 
-/// Account + token store: `~/.ccc/store.json`.
+/// Legacy plaintext account store: `~/.ccc/store.json`. Read for migration
+/// only; every write goes to the encrypted store.
 pub fn store_file() -> Result<PathBuf> {
     Ok(ccc_dir()?.join("store.json"))
+}
+
+/// Encrypted account + token store: `~/.ccc/store.enc`.
+pub fn store_enc_file() -> Result<PathBuf> {
+    Ok(ccc_dir()?.join("store.enc"))
 }
 
 /// Live per-thread routing table: `~/.ccc/routes.json`.

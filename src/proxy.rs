@@ -73,6 +73,21 @@ pub async fn run(port: u16) -> Result<()> {
         .fallback(any(proxy))
         .with_state(state);
 
+    // Move a pre-encryption store to the sealed format before serving. Never
+    // fatal: per-request loads surface any real problem with context.
+    match Store::migrate_plaintext() {
+        Ok(true) => eprintln!("ccc: migrated plaintext store.json to encrypted store.enc"),
+        Ok(false) => {}
+        Err(e) => eprintln!("ccc: store migration failed: {e:#}"),
+    }
+
+    // Where Claude Code's login is a plain file, watch for `/login` replacing
+    // the ccc seed with a live grant and re-take ownership. On macOS the
+    // daemon never touches the Keychain (ACL prompts), so detection is left
+    // to `ccc doctor` / `ccc setup` and the invalid_grant error hint.
+    #[cfg(not(target_os = "macos"))]
+    tokio::spawn(seed_watcher());
+
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     let listener = tokio::net::TcpListener::bind(addr)
         .await
@@ -93,6 +108,49 @@ pub async fn run(port: u16) -> Result<()> {
 
 async fn health() -> impl IntoResponse {
     (StatusCode::OK, "ccc ok")
+}
+
+/// Periodically reconcile Claude Code's credential file with the ccc store.
+/// `CCC_SEED_CHECK_SECS` tunes the cadence (default 30s; the check is one
+/// small file read). A foreign login is reported once, not every tick.
+#[cfg(not(target_os = "macos"))]
+async fn seed_watcher() {
+    use crate::creds::Reconcile;
+
+    let secs = std::env::var("CCC_SEED_CHECK_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(30)
+        .max(1);
+    let mut warned_foreign = false;
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(secs));
+    loop {
+        interval.tick().await;
+        match tokio::task::spawn_blocking(crate::creds::reconcile).await {
+            Ok(Ok(Reconcile::Healed(name))) => {
+                warned_foreign = false;
+                eprintln!(
+                    "[{}] ccc: Claude Code held a live login (a /login ran?) — re-imported it \
+                     into `{name}` and re-seeded",
+                    utc_now()
+                );
+            }
+            Ok(Ok(Reconcile::Foreign { email })) => {
+                if !warned_foreign {
+                    warned_foreign = true;
+                    eprintln!(
+                        "[{}] ccc: Claude Code holds a live login for an unknown account{} — \
+                         run `ccc import <name>` to save it, or `ccc setup` to re-own it",
+                        utc_now(),
+                        email.map(|e| format!(" ({e})")).unwrap_or_default()
+                    );
+                }
+            }
+            Ok(Ok(_)) => warned_foreign = false,
+            Ok(Err(e)) => eprintln!("[{}] ccc: seed reconcile failed: {e:#}", utc_now()),
+            Err(_) => {}
+        }
+    }
 }
 
 async fn proxy(
@@ -306,16 +364,26 @@ async fn ensure_fresh_token(state: &AppState, profile: &str) -> Result<String> {
             // Back off only on permanent auth failures (invalid/rotated-away
             // refresh token). Transient errors — timeouts, 5xx — should retry
             // on the next request, not lock the profile out for 30s.
-            if format!("{e:#}").contains("invalid_grant") {
+            let invalid_grant = format!("{e:#}").contains("invalid_grant");
+            if invalid_grant {
                 state
                     .refresh_failures
                     .lock()
                     .await
                     .insert(profile.to_string(), std::time::Instant::now());
             }
-            Err(e.context(format!(
-                "refreshing token for `{profile}` (re-auth with `ccc login {profile}` if this persists)"
-            )))
+            // A dead refresh token usually means another refresher rotated the
+            // grant — i.e. someone ran /login in Claude Code — so point at
+            // `ccc import` (re-own that login) before a full re-auth.
+            let hint = if invalid_grant {
+                format!(
+                    "if /login was run in Claude Code recently, `ccc import` re-owns that \
+                     login; otherwise re-auth with `ccc login {profile}`"
+                )
+            } else {
+                format!("re-auth with `ccc login {profile}` if this persists")
+            };
+            Err(e.context(format!("refreshing token for `{profile}` ({hint})")))
         }
     }
 }
