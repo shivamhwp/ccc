@@ -18,14 +18,11 @@ use anyhow::{Context, Result};
 use std::io::Write;
 use std::path::PathBuf;
 
+use crate::creds;
 use crate::daemon;
 use crate::oauth;
 use crate::paths;
 use crate::store::{Profile, Store};
-
-/// A far-future expiry (year 2100) so Claude Code treats the seeded token as
-/// valid and never tries to refresh it. Actual traffic is re-authed by the proxy.
-const FAR_FUTURE_MS: i64 = 4_102_444_800_000;
 
 fn t3_settings_file() -> Result<PathBuf> {
     if let Some(p) = std::env::var_os("CCC_T3_SETTINGS") {
@@ -110,18 +107,11 @@ pub async fn provision_home(account: &str, profile: &Profile) -> Result<PathBuf>
 
     // .credentials.json — satisfies the auth gate + drives the subscription
     // display; far-future expiry so Claude Code never refreshes it.
-    let cred = serde_json::json!({
-        "claudeAiOauth": {
-            "accessToken": profile.access_token,
-            "refreshToken": profile.refresh_token,
-            "expiresAt": FAR_FUTURE_MS,
-            "scopes": profile.scopes,
-            "subscriptionType": sub.clone().unwrap_or_else(|| "max".into()),
-        }
-    });
+    let mut seeded = profile.clone();
+    seeded.subscription_type = sub.clone().or(seeded.subscription_type);
+    let cred = creds::oauth_json(&seeded, creds::FAR_FUTURE_MS);
     let cred_path = home.join(".credentials.json");
-    std::fs::write(&cred_path, serde_json::to_vec(&cred)?)?;
-    paths::set_mode(&cred_path, 0o600)?;
+    creds::write_secret_file(&cred_path, &serde_json::to_vec(&cred)?)?;
 
     Ok(home)
 }

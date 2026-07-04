@@ -39,12 +39,11 @@ pub fn patch_settings(base_url: &str) -> Result<String> {
         "ANTHROPIC_BASE_URL".to_string(),
         serde_json::json!(base_url),
     );
-    // We deliberately do NOT set ANTHROPIC_AUTH_TOKEN. Claude Code's real
-    // claude.ai login (in the config dir / Keychain) satisfies the auth gate and
-    // drives the account/subscription shown in `/status` — so it reads as a
-    // subscription, not "API key". The proxy still swaps the actual per-request
-    // token for non-default / pinned routes. Clean up any placeholder a previous
-    // ccc version wrote.
+    // We deliberately do NOT set ANTHROPIC_AUTH_TOKEN. The seeded login in the
+    // config dir / Keychain satisfies Claude Code's auth gate and drives the
+    // account/subscription shown in `/status` — so it reads as a subscription,
+    // not "API key". The proxy injects the real per-request token for every
+    // route. Clean up any placeholder a previous ccc version wrote.
     if env_obj.get("ANTHROPIC_AUTH_TOKEN").and_then(|v| v.as_str()) == Some("ccc-managed-by-proxy")
     {
         env_obj.remove("ANTHROPIC_AUTH_TOKEN");

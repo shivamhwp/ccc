@@ -57,7 +57,7 @@ That's it — the account is live for that thread within a couple of seconds, an
 |---|---|
 | `ccc setup` | Import current login, patch Claude Code `settings.json`, install the agent skill + daemon |
 | `ccc login <name>` | Browser OAuth login, saved under a profile name |
-| `ccc import [name]` | Seed a profile from the current Claude Code login |
+| `ccc import [name]` | Save the current Claude Code login as a profile (ccc takes over its token refresh) |
 | `ccc use <name>` | Route **this thread** to an account |
 | `ccc use --default` | Revert this thread to the default account |
 | `ccc whoami` | Which account is this thread using? |
@@ -67,7 +67,7 @@ That's it — the account is live for that thread within a couple of seconds, an
 | `ccc doctor` | Verify daemon, settings, and auth path |
 | `ccc daemon run \| start \| stop \| status` | Control the local proxy daemon |
 | `ccc t3 sync \| unsync` | Add/remove one [t3code](https://github.com/pingdotgg/t3code) provider instance per account |
-| `ccc teardown` | Undo `ccc setup` (revert settings, remove skill, stop daemon) |
+| `ccc teardown` | Undo `ccc setup` (revert settings, hand the login back to Claude Code, remove skill, stop daemon) |
 
 ## How it works
 
@@ -85,8 +85,7 @@ That's it — the account is live for that thread within a couple of seconds, an
 
 Because selection happens per request, `ccc use <name>` changes the account for the current thread instantly — no restart, and independent of your shell (routing is process-based).
 
-> [!NOTE]
-> Claude Code won't send a request unless it thinks it's logged in, so `ccc setup` also writes a placeholder `ANTHROPIC_AUTH_TOKEN` to satisfy that gate. The proxy always overwrites the auth header, so the placeholder is never actually used.
+**Credential ownership.** Anthropic rotates refresh tokens on use, so a token shared by two refreshers breaks whichever refreshes second. ccc therefore owns every saved account's tokens outright: `ccc setup` (or `ccc import`) copies the live login into `~/.ccc/store.json` once, then overwrites Claude Code's own credentials with a far-future-expiry copy. Claude Code sees a login that never expires — it stays "logged in" (correct account in `/status`), never refreshes, and never touches the Keychain — while the proxy injects the real, ccc-refreshed token on every request. `ccc teardown` writes the live tokens back, returning ownership to Claude Code.
 
 ## For your agents
 

@@ -135,42 +135,6 @@ pub fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-/// Read the current Claude Code login from the macOS Keychain, if present.
-/// Returns the raw `claudeAiOauth` object.
-#[cfg(target_os = "macos")]
-pub fn read_keychain_login() -> Result<serde_json::Value> {
-    let out = std::process::Command::new("security")
-        .args([
-            "find-generic-password",
-            "-s",
-            "Claude Code-credentials",
-            "-w",
-        ])
-        .output()
-        .context("running `security` to read Keychain")?;
-    if !out.status.success() {
-        return Err(anyhow!(
-            "no Claude Code login found in Keychain (run `claude` and /login first)"
-        ));
-    }
-    let text = String::from_utf8(out.stdout)?;
-    let v: serde_json::Value = serde_json::from_str(text.trim())?;
-    v.get("claudeAiOauth")
-        .cloned()
-        .ok_or_else(|| anyhow!("Keychain entry missing claudeAiOauth"))
-}
-
-#[cfg(not(target_os = "macos"))]
-pub fn read_keychain_login() -> Result<serde_json::Value> {
-    // Linux/Windows: Claude Code stores a plaintext credentials file.
-    let path = paths::claude_dir()?.join(".credentials.json");
-    let bytes = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
-    let v: serde_json::Value = serde_json::from_slice(&bytes)?;
-    v.get("claudeAiOauth")
-        .cloned()
-        .ok_or_else(|| anyhow!("credentials file missing claudeAiOauth"))
-}
-
 /// Build a Profile from a `claudeAiOauth` JSON object.
 pub fn profile_from_oauth(v: &serde_json::Value) -> Result<Profile> {
     let access_token = v
