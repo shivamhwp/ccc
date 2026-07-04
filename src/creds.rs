@@ -97,13 +97,20 @@ fn write_login_raw(data: &str) -> Result<()> {
     // to $USER). `-U` updates the existing item in place, preserving its ACL so
     // Claude Code keeps silent read access to its own credentials. The command
     // goes through `security -i` stdin — as an argv the credential blob would
-    // be visible in the process list for the duration of the write.
+    // be visible in the process list for the duration of the write. The secret
+    // is passed with `-X` (hex) so it needs no quoting for `security`'s
+    // interactive parser regardless of its contents.
     let user = std::env::var("USER").unwrap_or_else(|_| "claude".into());
+    if user.chars().any(char::is_control) {
+        return Err(anyhow!(
+            "refusing to write Keychain item: USER contains control characters"
+        ));
+    }
     let quote = |s: &str| format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""));
     let cmd = format!(
-        "add-generic-password -U -s \"Claude Code-credentials\" -a {} -w {}\n",
+        "add-generic-password -U -s \"Claude Code-credentials\" -a {} -X {}\n",
         quote(&user),
-        quote(data),
+        hex_encode(data.as_bytes()),
     );
     let mut child = std::process::Command::new("security")
         .arg("-i")
@@ -112,13 +119,15 @@ fn write_login_raw(data: &str) -> Result<()> {
         .stderr(std::process::Stdio::piped())
         .spawn()
         .context("running `security` to write Keychain")?;
-    child
+    let write_res = child
         .stdin
         .take()
         .expect("piped stdin")
-        .write_all(cmd.as_bytes())
-        .context("sending credentials to `security`")?;
+        .write_all(cmd.as_bytes());
+    // Reap the child before propagating a write error, or it lingers as a
+    // zombie until the parent exits.
     let out = child.wait_with_output()?;
+    write_res.context("sending credentials to `security`")?;
     if !out.status.success() {
         return Err(anyhow!(
             "writing Claude Code credentials to Keychain failed: {}",
@@ -126,6 +135,19 @@ fn write_login_raw(data: &str) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+/// Uppercase hex for `security add-generic-password -X`, which takes the
+/// password as a hex string.
+#[cfg(any(target_os = "macos", test))]
+fn hex_encode(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    bytes
+        .iter()
+        .fold(String::with_capacity(bytes.len() * 2), |mut s, b| {
+            let _ = write!(s, "{b:02X}");
+            s
+        })
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -174,6 +196,15 @@ mod tests {
             organization_uuid: None,
             organization_name: None,
         }
+    }
+
+    #[test]
+    fn hex_encode_is_plain_hex_for_any_input() {
+        assert_eq!(hex_encode(b"{\"a\":1}"), "7B2261223A317D");
+        // Newlines, quotes, and backslashes — everything the `security -i`
+        // parser could trip on — come out as [0-9A-F] only.
+        let hex = hex_encode("evil\"\\\ntoken".as_bytes());
+        assert!(hex.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
     #[test]
