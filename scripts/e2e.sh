@@ -45,7 +45,8 @@ MOCK_PORT="${CCC_E2E_MOCK_PORT:-9917}"
 FAR_FUTURE=4102444800000
 
 # --- hermetic environment -----------------------------------------------------
-export HOME="$(mktemp -d)"
+HOME="$(mktemp -d)" || { echo "mktemp failed"; exit 1; }
+export HOME
 export CLAUDE_CONFIG_DIR="$HOME/.claude"
 export CCC_KEY_FILE="$HOME/.ccc/e2e.key"
 export CCC_UPSTREAM_BASE="http://127.0.0.1:$MOCK_PORT"

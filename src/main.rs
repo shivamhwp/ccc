@@ -212,6 +212,15 @@ fn cmd_store_import(path: &str) -> Result<()> {
     let imported: Store = serde_json::from_slice(&bytes).context("parsing store JSON")?;
     let n = imported.profiles.len();
     Store::update(move |s| {
+        // Import replaces the whole store; refuse to wipe saved accounts with
+        // an empty one (every Store field is serde-default, so `{}` parses).
+        if imported.profiles.is_empty() && !s.profiles.is_empty() {
+            anyhow::bail!(
+                "the imported store has no profiles, but {} account(s) are saved — \
+                 refusing to wipe them (use `ccc remove <name>` to delete accounts)",
+                s.profiles.len()
+            );
+        }
         *s = imported;
         Ok(())
     })?;
