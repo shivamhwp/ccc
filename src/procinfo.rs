@@ -380,8 +380,38 @@ pub fn command_of(pid: u32) -> String {
 /// lifetime. Routes record it so a pid recycled by the OS (same number, new
 /// process) no longer matches. None when the process is gone or the platform
 /// query fails.
-#[cfg(target_os = "linux")]
+///
+/// Cached briefly: the proxy calls this per request via route resolution, and
+/// the platform lookup spawns `ps`/PowerShell everywhere but Linux. A
+/// (pid, token) pair can only go stale if the pid is recycled within the TTL —
+/// a far smaller window than the unguarded resolution this token protects
+/// against.
 pub fn pid_start_token(pid: u32) -> Option<String> {
+    use std::sync::{Mutex, OnceLock};
+    use std::time::{Duration, Instant};
+
+    const TTL: Duration = Duration::from_secs(2);
+    type Cache = Mutex<HashMap<u32, (Instant, Option<String>)>>;
+    static CACHE: OnceLock<Cache> = OnceLock::new();
+
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(map) = cache.lock() {
+        if let Some((at, token)) = map.get(&pid) {
+            if at.elapsed() < TTL {
+                return token.clone();
+            }
+        }
+    }
+    let token = pid_start_token_uncached(pid);
+    if let Ok(mut map) = cache.lock() {
+        map.retain(|_, (at, _)| at.elapsed() < TTL);
+        map.insert(pid, (Instant::now(), token.clone()));
+    }
+    token
+}
+
+#[cfg(target_os = "linux")]
+fn pid_start_token_uncached(pid: u32) -> Option<String> {
     // Field 22 of /proc/<pid>/stat is starttime (clock ticks since boot).
     // comm (field 2) may contain spaces and parens, so split after the last
     // closing paren: state is the next token, starttime the 20th.
@@ -391,7 +421,7 @@ pub fn pid_start_token(pid: u32) -> Option<String> {
 }
 
 #[cfg(all(unix, not(target_os = "linux")))]
-pub fn pid_start_token(pid: u32) -> Option<String> {
+fn pid_start_token_uncached(pid: u32) -> Option<String> {
     let out = std::process::Command::new("ps")
         .args(["-p", &pid.to_string(), "-o", "lstart="])
         .output()
@@ -404,7 +434,7 @@ pub fn pid_start_token(pid: u32) -> Option<String> {
 }
 
 #[cfg(windows)]
-pub fn pid_start_token(pid: u32) -> Option<String> {
+fn pid_start_token_uncached(pid: u32) -> Option<String> {
     let script =
         format!("(Get-Process -Id {pid} -ErrorAction SilentlyContinue).StartTime.ToFileTime()");
     let out = std::process::Command::new("powershell")
@@ -452,7 +482,9 @@ mod tests {
         let me = self_pid();
         let a = pid_start_token(me);
         assert!(a.is_some(), "start token for our own pid must resolve");
+        // Second call is served by the cache; a fresh platform lookup agrees.
         assert_eq!(a, pid_start_token(me));
+        assert_eq!(a, pid_start_token_uncached(me));
     }
 
     #[test]
